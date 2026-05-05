@@ -1,0 +1,105 @@
+acquisition:
+  launch_alpha_sources:
+    solana_new_pools:
+      enabled: true
+      provider: dexscreener_latest_profiles
+      source_name: launch_alpha_solana
+      chain: solana
+      source_url: https://api.dexscreener.com/token-profiles/latest/v1
+      fallback_source_urls: []
+      pair_detail_url: https://api.dexscreener.com/latest/dex/tokens
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.5
+      cache_ttl_seconds: 15.0
+      min_request_interval_seconds: 0.25
+      max_seed_records: 40
+      max_snapshot_age_seconds: 120.0
+      dex_allowlist: [raydium, orca]
+      quote_asset_allowlist: [USDC, SOL]
+      token_denylist: [USDT, USDC, SOL]
+      min_initial_liquidity_usd: 18000.0
+      min_buy_notional_5m_usd: 9000.0
+      min_trade_count_5m: 12
+      min_unique_wallets_5m: 8
+      min_liquidity_lock_ratio: 0.85
+      max_creator_hold_pct: 0.15
+    base_new_pools:
+      enabled: true
+      provider: dexscreener_latest_profiles
+      source_name: launch_alpha_base
+      chain: base
+      source_url: https://api.dexscreener.com/token-profiles/latest/v1
+      fallback_source_urls: []
+      pair_detail_url: https://api.dexscreener.com/latest/dex/tokens
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.5
+      cache_ttl_seconds: 15.0
+      min_request_interval_seconds: 0.25
+      max_seed_records: 50
+      max_snapshot_age_seconds: 120.0
+      dex_allowlist: [uniswap_v3, aerodrome]
+      quote_asset_allowlist: [USDC, WETH]
+      token_denylist: [USDC, WETH]
+      min_initial_liquidity_usd: 30000.0
+      min_buy_notional_5m_usd: 15000.0
+      min_trade_count_5m: 16
+      min_unique_wallets_5m: 10
+      min_liquidity_lock_ratio: 0.85
+      max_creator_hold_pct: 0.15
+  catalyst_alpha_sources:
+    binance_listings:
+      enabled: false
+      provider: rss_keyword_feed
+      source_name: catalyst_alpha_binance
+      source_url: https://www.binance.com/en/support/announcement/rss
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.75
+      max_entries: 20
+      max_snapshot_age_minutes: 720
+      required_keywords: [list, listing, roadmap, launch]
+      excluded_keywords: [delist, removal, maintenance, suspend]
+      token_configs:
+        - token: AERO
+          chain: base
+          aliases: [aerodrome]
+          catalyst_type: cex_listing_announcement
+          venue: binance
+          impact_score: 0.88
+          credibility_score: 0.92
+    coinbase_blog:
+      enabled: false
+      provider: rss_keyword_feed
+      source_name: catalyst_alpha_coinbase
+      source_url: https://blog.coinbase.com/feed
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.75
+      max_entries: 20
+      max_snapshot_age_minutes: 720
+      required_keywords: [list, listing, roadmap, asset]
+      excluded_keywords: [delist, removal, maintenance, suspend]
+      token_configs:
+        - token: ARB
+          chain: arbitrum
+          aliases: [arbitrum]
+          catalyst_type: cex_listing_announcement
+          venue: coinbase
+          impact_score: 0.8
+          credibility_score: 0.88
+  flow_alpha_sources:
+    base_aero_wallet_flow:
+      enabled: false
+      provider: wallet_intelligence_store
+      source_name: flow_alpha_base_aero
+      chain: base
+      token: AERO
+      venue: aerodrome
+      window_minutes: 15
+      min_whale_buy_usd: 10000.0
+      min_netflow_15m_usd: 25000.0
+      min_smart_money_inflow_usd: 40000.0
+      min_unique_buyer_wallets_15m: 4
+      min_exchange_outflow_usd: 0.0

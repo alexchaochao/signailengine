@@ -1,0 +1,410 @@
+# 应用基础信息与运行模式。
+runtime:
+  app_name: signalengine
+  environment: local
+  log_level: INFO
+
+# Redis Streams 是主事件总线，raw-events/signals/decisions/executions 都从这里流转。
+redis:
+  url: redis://localhost:6379/0
+  raw_events_stream: raw-events
+  signals_stream: signals
+  decisions_stream: decisions
+  executions_stream: executions
+
+# PostgreSQL 用于审计、状态、checkpoint、特征快照与发现候选缓存。
+postgres:
+  url: postgresql+psycopg://signalengine:signalengine@localhost:5432/signalengine
+  echo: false
+  pool_size: 5
+  max_overflow: 10
+
+# 观测与告警阈值。
+observability:
+  service_namespace: signalengine
+  metrics_host: 0.0.0.0
+  metrics_port: 9000
+  max_event_lag_seconds: 30.0
+  max_pipeline_latency_seconds: 5.0
+  max_consecutive_adapter_failures: 3
+  max_risk_rejections: 5
+
+# 风控硬阈值；live_trading_enabled 只是总开关，真正 live 还受 .env 与 rollout 约束。
+risk:
+  max_token_exposure: 0.10
+  max_chain_exposure: 0.40
+  max_concurrent_positions: 5
+  max_daily_loss: 0.03
+  cooldown_minutes: 30
+  min_liquidity_usd: 100000
+  min_volume_5m_usd: 25000
+  max_slippage_bps: 150
+  live_trading_enabled: false
+
+# replay 回归阈值，主要用于回放/回归对比，而非实时交易决策。
+replay:
+  regression_thresholds:
+    fill_rate: 0.01
+    rejection_rate: 0.01
+    average_executed_notional_usd: 1.0
+    route_count: 1.0
+    risk_rejection_reason_count: 1.0
+    strategy_executed_notional_usd: 1.0
+
+# 特征工程窗口与 slippage 采样参数。
+features:
+  onchain:
+    trade_windows: [1m, 5m, 15m]
+    buy_pressure_primary_window: 5m
+    min_trade_count_for_buy_pressure: 10
+    max_trade_lag_seconds: 30.0
+  slippage:
+    quote_notional_usd: [1000.0, 5000.0, 10000.0]
+    publication_notional_usd: 5000.0
+    max_quote_age_seconds: 5.0
+    allow_curve_fallback: true
+
+# 对外通知：当前只给 Telegram 单 chat 推送首次进入 QUALIFIED 的 LAUNCH / CATALYST。
+notifications:
+  telegram:
+    enabled: false
+    bot_token:
+    chat_id:
+    publish_alpha_types: [LAUNCH, CATALYST]
+    min_score: 0.0
+    message_template_version: v1
+    consumer_group: telegram-publisher
+    consumer_name: telegram-publisher-1
+
+# 生产采集链路配置：链上 trade / quote、launch / catalyst / flow alpha 都从这里开关与参数化。
+acquisition:
+  sync_interval_seconds: 5.0
+  failure_backoff_seconds: 5.0
+  source_cooldown_seconds: 60.0
+
+  # 直接盯某个 Solana 地址或 owner 的交易流，适合钱包级观察，不参与当前默认执行主线。
+  solana_wallet_trade:
+    enabled: false
+    provider: solana_rpc_wallet_watch
+    source_name: solana_rpc_wallet
+    checkpoint_key: acquisition:solana_wallet_trades
+    chain: solana
+    source_kind: wallet
+    signature_address:
+    owner_address:
+    wallet_address:
+    token: BONK
+    token_mint:
+    quote_asset: USDC
+    quote_mint:
+    quote_asset_usd_rate: 1.0
+    pool_address: wallet-watch
+    poll_limit: 20
+
+  # 单一路由 Jupiter quote fallback；当前更推荐使用 jupiter_quote_routes 按 token 分路由。
+  jupiter_quote:
+    enabled: false
+    provider: jupiter_quote_api
+    source_name: jupiter_quote_api
+    chain: solana
+    token: BONK
+    input_mint:
+    output_mint:
+    input_decimals: 6
+    output_decimals: 5
+    quote_notional_usd: 5000.0
+    slippage_bps: 100
+    quote_url: https://lite-api.jup.ag/swap/v1/quote
+    swap_url: https://lite-api.jup.ag/swap/v1/swap
+    price_url: https://lite-api.jup.ag/price/v2
+
+  # Solana token -> Jupiter 路由表，live execution 与 quote 采样都优先走这里。
+  jupiter_quote_routes: {}
+
+  # 旧版单入口 EVM transfer watch，现仅保留为兼容入口；加载后会自动投影进统一 evm_routes registry。
+  evm_transfer_trade:
+    enabled: false
+    provider: evm_rpc_transfer_watch
+    source_name: evm_rpc_transfer
+    checkpoint_key: acquisition:evm_transfer_trades
+    chain: base
+    wallet_address:
+    token: AERO
+    token_contract:
+    quote_asset: USDC
+    quote_contract:
+    token_decimals: 18
+    quote_decimals: 6
+    quote_asset_usd_rate: 1.0
+    pool_address: wallet-watch
+    initial_lookback_blocks: 100
+
+  # 多链 EVM 链级默认参数：新增链时优先在这里声明 chain_id / provider / quote API。
+  evm_chains:
+    base:
+      chain_id: 8453
+      provider: evm_quote_api
+      api_provider: zeroex
+      quote_api_url: https://api.0x.org/swap/permit2/price
+      price_url: https://api.dexscreener.com/latest/dex/tokens
+    ethereum:
+      chain_id: 1
+      provider: evm_rpc_pool_swap_watch
+      api_provider: zeroex
+      quote_api_url: https://api.0x.org/swap/permit2/price
+      price_url: https://api.dexscreener.com/latest/dex/tokens
+    arbitrum:
+      chain_id: 42161
+      provider: evm_rpc_transfer_watch
+      api_provider: zeroex
+      quote_api_url: https://api.0x.org/swap/permit2/price
+      price_url: https://api.dexscreener.com/latest/dex/tokens
+
+  # 多链 EVM route registry：只保留 token / pair / source_type 等 route 级字段。
+  evm_routes:
+    base_quote:
+      enabled: false
+      source_type: quote
+      source_name: evm_base_quote
+      checkpoint_key: acquisition:evm_routes:base_quote
+      chain: base
+      token: AERO
+      token_contract:
+      quote_asset: USDC
+      quote_contract:
+      token_decimals: 18
+      quote_decimals: 6
+      quote_notional_usd: 5000.0
+      quote_slippage_bps: 100
+    ethereum_pool:
+      enabled: false
+      source_type: pool_swap_trade
+      source_name: evm_ethereum_pool
+      checkpoint_key: acquisition:evm_routes:ethereum_pool
+      chain: ethereum
+      token: UNI
+      token_contract:
+      quote_asset: USDC
+      quote_contract:
+      token_decimals: 18
+      quote_decimals: 6
+      quote_asset_usd_rate: 1.0
+      pool_address:
+      pool_protocol: uniswap_v3
+      token_is_token0: true
+      initial_lookback_blocks: 100
+    arbitrum_transfer:
+      enabled: false
+      source_type: transfer_trade
+      source_name: evm_arbitrum_transfer
+      checkpoint_key: acquisition:evm_routes:arbitrum_transfer
+      chain: arbitrum
+      wallet_address:
+      token: ARB
+      token_contract:
+      quote_asset: USDC
+      quote_contract:
+      token_decimals: 18
+      quote_decimals: 6
+      quote_asset_usd_rate: 1.0
+      pool_address: wallet-watch
+      initial_lookback_blocks: 100
+
+  # Launch Alpha：新池子/新对的发现链。
+  launch_alpha_sources:
+    solana_new_pools:
+      enabled: false
+      provider: dexscreener_latest_profiles
+      source_name: launch_alpha_solana
+      chain: solana
+      source_url: https://api.dexscreener.com/token-profiles/latest/v1
+      fallback_source_urls: []
+      pair_detail_url: https://api.dexscreener.com/latest/dex/tokens
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.5
+      cache_ttl_seconds: 15.0
+      min_request_interval_seconds: 0.25
+      max_seed_records: 40
+      max_snapshot_age_seconds: 120.0
+      dex_allowlist: [raydium, orca]
+      quote_asset_allowlist: [USDC, SOL]
+      token_allowlist: []
+      token_denylist: [USDT, USDC, SOL]
+      min_initial_liquidity_usd: 18000.0
+      min_buy_notional_5m_usd: 9000.0
+      min_trade_count_5m: 12
+      min_unique_wallets_5m: 8
+      min_liquidity_lock_ratio: 0.85
+      max_creator_hold_pct: 0.15
+    base_new_pools:
+      enabled: false
+      provider: dexscreener_latest_profiles
+      source_name: launch_alpha_base
+      chain: base
+      source_url: https://api.dexscreener.com/token-profiles/latest/v1
+      fallback_source_urls: []
+      pair_detail_url: https://api.dexscreener.com/latest/dex/tokens
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.5
+      cache_ttl_seconds: 15.0
+      min_request_interval_seconds: 0.25
+      max_seed_records: 50
+      max_snapshot_age_seconds: 120.0
+      dex_allowlist: [uniswap_v3, aerodrome]
+      quote_asset_allowlist: [USDC, WETH]
+      token_allowlist: []
+      token_denylist: [USDC, WETH]
+      min_initial_liquidity_usd: 30000.0
+      min_buy_notional_5m_usd: 15000.0
+      min_trade_count_5m: 16
+      min_unique_wallets_5m: 10
+      min_liquidity_lock_ratio: 0.85
+      max_creator_hold_pct: 0.15
+
+  # Catalyst Alpha：公告 / RSS 类催化信息。
+  catalyst_alpha_sources:
+    binance_listings:
+      enabled: true
+      provider: binance_cms_api
+      source_name: catalyst_alpha_binance
+      source_url: https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=20
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.75
+      max_entries: 20
+      max_snapshot_age_minutes: 720
+      required_keywords: [list, listing, roadmap, launch]
+      excluded_keywords: [delist, removal, maintenance, suspend]
+      token_configs:
+        - token: AERO
+          chain: base
+          aliases: [aerodrome]
+          catalyst_type: cex_listing_announcement
+          venue: binance
+          impact_score: 0.88
+          credibility_score: 0.92
+        - token: ARB
+          chain: arbitrum
+          aliases: [arbitrum]
+          catalyst_type: cex_listing_announcement
+          venue: binance
+          impact_score: 0.82
+          credibility_score: 0.92
+    coinbase_blog:
+      enabled: true
+      provider: coinbase_html_page
+      source_name: catalyst_alpha_coinbase
+      source_url: https://blog.coinbase.com/feed
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.75
+      max_entries: 20
+      max_snapshot_age_minutes: 720
+      required_keywords: [list, listing, roadmap, asset]
+      excluded_keywords: [delist, removal, maintenance, suspend]
+      token_configs:
+        - token: ARB
+          chain: arbitrum
+          aliases: [arbitrum]
+          catalyst_type: cex_listing_announcement
+          venue: coinbase
+          impact_score: 0.8
+          credibility_score: 0.88
+
+          # Flow Alpha：聪明钱包与资金流聚合结果。
+  flow_alpha_sources:
+    base_aero_wallet_flow:
+      enabled: false
+      provider: wallet_intelligence_store
+      source_name: flow_alpha_base_aero
+      chain: base
+      token: AERO
+      venue: aerodrome
+      window_minutes: 15
+      min_whale_buy_usd: 10000.0
+      min_netflow_15m_usd: 25000.0
+      min_smart_money_inflow_usd: 40000.0
+      min_unique_buyer_wallets_15m: 4
+      min_exchange_outflow_usd: 0.0
+
+    # live 运行期控制：资金缓冲、kill switch、凭证来源、余额与定价 provider。
+live:
+  require_environment_separation: true
+  rollout:
+    global_kill_switch_enabled: false
+    global_kill_switch_reason: ""
+    capped_notional_usd: 100.0
+    min_available_balance_usd: 500.0
+    enforce_position_preflight: true
+    enforce_balance_preflight: true
+
+  # 凭证只能通过环境变量注入；yaml 中必须保持空值。
+  credentials:
+    chain_wallets: {}
+    dex_providers: {}
+    cex_providers: {}
+
+  # live 余额来源；当前只配置了 solana / ethereum 默认映射。
+  balance:
+    native_asset_sources:
+      solana:
+        provider: solana_rpc
+      ethereum:
+        provider: evm_rpc
+
+  # native asset 定价来源；执行 sizing 与余额估值会消费这里。
+  pricing:
+    timeout_seconds: 3.0
+    max_retries: 1
+    native_asset_sources:
+      solana:
+        provider: coingecko_simple_price
+        asset: SOL
+        quote_currency: USD
+        lookup_key: solana
+        url: https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd
+      ethereum:
+        provider: binance_ticker_price
+        asset: ETH
+        quote_currency: USD
+        lookup_key: ETHUSDT
+        url: https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT
+
+  # 钱包情报同步任务的默认参数。
+  wallet_intelligence:
+    enabled: false
+    chain: solana
+    chain_index: "501"
+    token: BONK
+    time_frame: "3"
+    sort_by: "1"
+    wallet_type: "3"
+    registry_version: okx_registry_v1
+    refresh_limit: 20
+    raw_event_batch_size: 1000
+    sync_interval_seconds: 300.0
+
+venues:
+  dex_adapter: solana_primary
+  cex_adapter: binance_paper
+  paper_execution_enabled: true
+  solana_rpc_url: https://api.mainnet-beta.solana.com
+  solana_rpc_timeout_seconds: 5.0
+  solana_rpc_max_retries: 2
+  solana_quote_slippage_bps: 100
+  solana_jito_enabled: false
+  native_asset_rpc:
+    ethereum:
+      url: https://ethereum.publicnode.com
+      timeout_seconds: 5.0
+      max_retries: 2
+    base:
+      url: https://base.publicnode.com
+      timeout_seconds: 5.0
+      max_retries: 2
+    arbitrum:
+      url: https://arbitrum.publicnode.com
+      timeout_seconds: 5.0
+      max_retries: 2

@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signalengine"
+version = "0.1.0"
+description = "Foundation for a Web3 hybrid trading system"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.8,<3",
+  "PyYAML>=6.0.2,<7",
+  "eth-account>=0.13,<0.14",
+  "httpx[http2]>=0.27,<0.29",
+  "redis>=6.0,<7",
+  "solders>=0.23,<0.27",
+  "SQLAlchemy>=2.0,<3",
+  "psycopg[binary]>=3.2,<4",
+  "prometheus-client>=0.22,<1",
+]
+
+[project.scripts]
+signalengine-worker = "core.worker:main"
+signalengine-replay = "replay.runner:main"
+signalengine-launch-alpha = "discovery.probe:main"
+signalengine-launch-alpha-rehearsal = "replay.launch_alpha_rehearsal:main"
+signalengine-flow-alpha-rehearsal = "replay.flow_alpha_rehearsal:main"
+signalengine-okx-diagnose = "sentinel.okx_diagnostics:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "ruff>=0.11,<0.12",
+  "mypy>=1.15,<2",
+  "types-PyYAML>=6.0.12,<7",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+check_untyped_defs = true
+disallow_incomplete_defs = false
+disallow_untyped_defs = false
+ignore_missing_imports = false
+packages = ["core", "discovery", "execution", "infra", "portfolio", "replay", "sentinel"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "discovery*", "execution*", "infra*", "portfolio*", "replay*", "sentinel*"]
