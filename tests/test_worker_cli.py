@@ -16,6 +16,7 @@ from core.worker import (
     run_catalyst_alpha_backfill,
     run_launch_alpha_backfill,
     run_launch_alpha_live_sync,
+    run_measurement_bridge,
     run_onchain_feature_backfill,
     run_onchain_feature_live_sync,
     run_social_confirmation_live,
@@ -736,7 +737,15 @@ def test_catalyst_alpha_live_sync_returns_zero_on_source_failure(monkeypatch) ->
             self.checkpoints = StubCheckpointStore()
 
     class StubSource:
-        config = type("Config", (), {"source_name": "catalyst_alpha_binance"})()
+        config = type(
+            "Config",
+            (),
+            {
+                "source_name": "catalyst_alpha_binance",
+                "provider": "binance_cms_api",
+                "source_url": "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=20",
+            },
+        )()
 
         def fetch_snapshots(self):
             calls.append("fetch_snapshots")
@@ -977,3 +986,20 @@ def test_onchain_feature_live_sync_returns_zero(monkeypatch) -> None:
     assert run_onchain_feature_live_sync(AppSettings.load()) == 0
     assert any(call[0] == "fetch_trades" for call in calls if isinstance(call, tuple))
     assert any(call == "fetch_quotes" for call in calls)
+
+
+def test_run_measurement_bridge_uses_redis_backed_registry(monkeypatch) -> None:
+    redis_client = object()
+    calls: list[object] = []
+
+    def _consume(redis_arg, settings_arg, registry, **kwargs):
+        calls.append((redis_arg, settings_arg, registry, kwargs))
+        return 1
+
+    monkeypatch.setattr("core.worker.get_redis_client", lambda settings: redis_client)
+    monkeypatch.setattr("core.worker.consume_discovery_events_for_measurement", _consume)
+
+    assert run_measurement_bridge(AppSettings.load()) == 0
+    assert calls[0][0] is redis_client
+    assert calls[0][2]._redis is redis_client
+    assert calls[0][3]["count"] == 20

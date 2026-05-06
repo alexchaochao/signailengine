@@ -55,6 +55,15 @@ SOCIAL_CONFIRMATION_TRIGGER_STATES = {
     TokenState.EARLY_LIQUIDITY,
     TokenState.NARRATIVE_EXPLOSION,
 }
+# Only these event types are fed into signal building.  All others (discovery
+# events, trade raw/quote, confirmation requests etc.) are acknowledged and
+# discarded — they either follow a separate processing path or are irrelevant
+# to the pipeline's signal → route → execute cycle.
+SIGNAL_TRIGGER_EVENT_TYPES = frozenset({
+    "onchain.liquidity_snapshot",
+    "wallet.cluster_snapshot",
+    "social.signal_snapshot",
+})
 
 
 @dataclass
@@ -88,7 +97,9 @@ class PipelineWorker:
         self.settings = settings
         self.redis_client = redis_client
         self.signal_engine = signal_engine or SignalEngine()
-        self.state_engine = state_engine or StateEngine()
+        self.state_engine = state_engine or StateEngine(
+            min_transition_interval_seconds=settings.risk.min_transition_interval_seconds,
+        )
         self.router = router or Router()
         self.risk_engine = risk_engine or RiskEngine()
         self.dex_executor = dex_executor or build_dex_adapter(settings)
@@ -201,6 +212,28 @@ class PipelineWorker:
         grouped: dict[str, list[tuple[str, EventEnvelope]]] = {}
 
         for message_id, event in messages:
+            # Discard events that are not signal triggers.  Discovery events,
+            # raw trades, quotes, analysis reports etc. are consumed by other
+            # services (measurement bridge, social confirmation, etc.) and
+            # should not enter the pipeline's signal → route → execute cycle.
+            if event.event_type not in SIGNAL_TRIGGER_EVENT_TYPES:
+                acknowledge_message(
+                    self.redis_client,
+                    self.settings.redis.raw_events_stream,
+                    group_name,
+                    message_id,
+                )
+                continue
+            if event.event_type == "social.signal_snapshot" and str(
+                event.payload.get("retrieval_mode", "")
+            ).lower() == "discovery":
+                acknowledge_message(
+                    self.redis_client,
+                    self.settings.redis.raw_events_stream,
+                    group_name,
+                    message_id,
+                )
+                continue
             grouped.setdefault(event.token, []).append((message_id, event))
 
         for token_messages in grouped.values():

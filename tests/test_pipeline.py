@@ -341,6 +341,42 @@ def test_pipeline_worker_processes_events_and_publishes_outputs() -> None:
     assert len(client.acked) == 2
 
 
+def test_pipeline_worker_skips_discovery_mode_social_snapshots() -> None:
+    settings = AppSettings.load()
+    client = FakeRedis()
+    worker = PipelineWorker(settings, cast(Redis, client))
+    worker.ensure_streams("signal-workers")
+
+    observed_at = datetime.now(UTC)
+    discovery_event = EventEnvelope(
+        event_id="social-discovery-1",
+        event_type="social.signal_snapshot",
+        source="social_reddit",
+        chain="unknown",
+        token="BONK",
+        observed_at=observed_at,
+        ingested_at=observed_at,
+        payload={
+            "social_sentiment": 0.8,
+            "social_velocity": 0.7,
+            "retrieval_mode": "discovery",
+        },
+    )
+    client.xadd(
+        settings.redis.raw_events_stream,
+        {
+            "kind": discovery_event.event_type,
+            "payload": discovery_event.model_dump_json(),
+        },
+    )
+
+    results = worker.poll_once("signal-workers", "worker-1")
+
+    assert results == []
+    assert len(client.acked) == 1
+    assert settings.redis.signals_stream not in client.streams
+
+
 def test_pipeline_worker_retries_once_and_persists_attempts() -> None:
     settings = AppSettings.load().model_copy(
         update={

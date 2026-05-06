@@ -24,6 +24,8 @@ def build_social_event(payload: dict[str, Any], source: str = "social_listener")
 
 	if "query" in payload:
 		normalized_payload["query"] = str(payload["query"])
+	if "retrieval_mode" in payload:
+		normalized_payload["retrieval_mode"] = str(payload["retrieval_mode"])
 	if "evidence_texts" in payload and isinstance(payload["evidence_texts"], list):
 		normalized_payload["evidence_texts"] = [str(item) for item in payload["evidence_texts"][:6]]
 

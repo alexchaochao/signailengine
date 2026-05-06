@@ -106,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--telegram-publisher-live", action="store_true")
     parser.add_argument("--social-live", action="store_true")
     parser.add_argument("--social-confirmation-live", action="store_true")
+    parser.add_argument("--measurement-bridge", action="store_true")
     parser.add_argument("--no-db", action="store_true")
     return parser
 
@@ -229,7 +230,7 @@ def run_onchain_feature_live_sync(
         now = datetime.now(UTC)
 
         # Consume discovery events to register dynamic measurement profiles
-        consumer_registry = registry or MeasurementProfileRegistry()
+        consumer_registry = registry or MeasurementProfileRegistry(redis_client=redis_client)
         consume_discovery_events_for_measurement(
             redis_client,
             settings,
@@ -286,7 +287,7 @@ def run_onchain_feature_live_sync(
                 metrics.live_source_consecutive_failures.labels(source=source_name).set(0.0)
                 metrics.live_source_next_eligible.labels(source=source_name).set(0.0)
                 _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
-            except Exception:
+            except Exception as error:
                 next_failures = state.consecutive_failures + 1
                 next_eligible_at = datetime.now(UTC) + _source_retry_delay(
                     settings.model_copy(update={"acquisition": acquisition_config}),
@@ -321,6 +322,26 @@ def run_onchain_feature_live_sync(
                     },
                 )
 
+    return 0
+
+
+def run_measurement_bridge(
+    settings: AppSettings,
+    *,
+    registry: MeasurementProfileRegistry | None = None,
+    count: int = 20,
+    sleep_seconds: float = 0.0,
+) -> int:
+    redis_client = get_redis_client(settings)
+    consumer_registry = registry or MeasurementProfileRegistry(redis_client=redis_client)
+    consume_discovery_events_for_measurement(
+        redis_client,
+        settings,
+        consumer_registry,
+        count=count,
+    )
+    if sleep_seconds > 0:
+        sleep(sleep_seconds)
     return 0
 
 
@@ -396,7 +417,7 @@ def run_catalyst_alpha_live_sync(settings: AppSettings) -> int:
                     },
                 )
                 continue
-            except Exception:
+            except Exception as error:
                 next_failures = state.consecutive_failures + 1
                 next_eligible_at = datetime.now(UTC) + _source_retry_delay(
                     settings.model_copy(update={"acquisition": acquisition_config}),
@@ -413,6 +434,9 @@ def run_catalyst_alpha_live_sync(settings: AppSettings) -> int:
                     extra={
                         "service": "catalyst_alpha_live",
                         "outcome": source_name,
+                        "provider": source.config.provider,
+                        "source_url": source.config.source_url,
+                        "error_type": type(error).__name__,
                     },
                 )
                 continue
@@ -583,7 +607,7 @@ def run_social_confirmation_live(
     *,
     group_name: str,
     consumer_name: str,
-    count: int = 100,
+    count: int = 20,
     block_ms: int | None = 1000,
 ) -> int:
     logger = get_logger("signalengine.social_confirmation_live")
@@ -1145,6 +1169,38 @@ def main() -> int:
                 count=args.count,
             )
             sleep(args.sleep_seconds)
+        return 0
+
+    if args.measurement_bridge:
+        acquisition_config = AcquisitionConfig.model_validate(settings.acquisition)
+        if args.once:
+            logger.info(
+                "measurement_bridge_once",
+                extra={
+                    "service": "measurement_bridge",
+                    "outcome": "once_mode_noop",
+                },
+            )
+            return 0
+
+        stop_event = Event()
+
+        def _handle_bridge_stop_signal(signum: int, frame: object) -> None:
+            _ = frame
+            logger.info(
+                "measurement_bridge_stop_requested",
+                extra={
+                    "service": "measurement_bridge",
+                    "outcome": f"signal_{signum}",
+                },
+            )
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, _handle_bridge_stop_signal)
+        signal.signal(signal.SIGTERM, _handle_bridge_stop_signal)
+
+        while not stop_event.is_set():
+            run_measurement_bridge(settings, sleep_seconds=acquisition_config.sync_interval_seconds)
         return 0
 
     if args.social_live:

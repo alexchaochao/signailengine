@@ -47,5 +47,6 @@ start_service social-live 9005 python -m core.worker --social-live
 start_service social-confirmation 9006 python -m core.worker --social-confirmation-live --group social-confirmation --consumer social-confirmation-1
 start_service telegram-publisher 9007 python -m core.worker --telegram-publisher-live
 start_service wallet-intelligence 9008 python -m core.worker --wallet-intelligence-sync
+start_service measurement-bridge 9009 python -m core.worker --measurement-bridge
 
 echo "logs: ${LOG_DIR}"

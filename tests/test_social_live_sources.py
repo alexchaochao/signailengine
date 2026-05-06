@@ -22,15 +22,15 @@ def test_build_social_live_sources_returns_enabled_reddit_sources() -> None:
                         "platform": "reddit",
                         "provider": "reddit_search_json",
                         "source_name": "social_reddit",
-                        "query_template": "{token}",
+                        "query_template": "new listings",
                     },
                     "x": {
                         "enabled": True,
                         "platform": "x",
                         "provider": "x_snapshot_json",
                         "source_name": "social_x",
-                        "query_template": "${cashtag} OR ${token}",
-                        "source_url": "https://social-bridge.example/x/search.json?q=%24BONK",
+                        "query_template": "trending listings",
+                        "source_url": "https://social-bridge.example/x/search.json",
                     },
                 }
             }
@@ -39,7 +39,67 @@ def test_build_social_live_sources_returns_enabled_reddit_sources() -> None:
 
     sources = build_social_live_sources(settings)
 
-    assert sources == []
+    assert len(sources) == 2
+    assert isinstance(sources[0], RedditSnapshotSource)
+    assert isinstance(sources[1], XSnapshotSource)
+
+
+def test_reddit_snapshot_source_in_discovery_mode_derives_token_from_posts() -> None:
+    now = datetime.now(UTC)
+    config = SocialLiveSourceConfig(
+        enabled=True,
+        provider="reddit_search_json",
+        platform="reddit",
+        source_name="reddit_discovery",
+        query_template="new listings",
+        subreddit="CryptoMoonShots",
+        min_mentions=2,
+        min_unique_authors=2,
+    )
+
+    def transport(url: str, headers: dict[str, str], timeout_seconds: float):
+        _ = url, headers, timeout_seconds
+        return {
+            "data": {
+                "children": [
+                    {
+                        "data": {
+                            "id": "post-1",
+                            "author": "alice",
+                            "title": "New listing rumor for $BONK",
+                            "created_utc": (now - timedelta(seconds=30)).timestamp(),
+                            "num_comments": 12,
+                            "upvote_ratio": 0.92,
+                            "score": 150,
+                            "subreddit_subscribers": 800000,
+                            "permalink": "/r/CryptoMoonShots/comments/post-1",
+                        }
+                    },
+                    {
+                        "data": {
+                            "id": "post-2",
+                            "author": "bob",
+                            "title": "$BONK might be next",
+                            "created_utc": (now - timedelta(seconds=60)).timestamp(),
+                            "num_comments": 8,
+                            "upvote_ratio": 0.88,
+                            "score": 90,
+                            "subreddit_subscribers": 800000,
+                            "permalink": "/r/CryptoMoonShots/comments/post-2",
+                        }
+                    },
+                ]
+            }
+        }
+
+    source = RedditSnapshotSource(AppSettings.load(), config, transport=transport)
+
+    events = source.fetch_events()
+
+    assert len(events) == 1
+    assert events[0].token == "BONK"
+    assert events[0].chain == "unknown"
+    assert events[0].payload["retrieval_mode"] == "discovery"
 
 
 def test_reddit_snapshot_source_aggregates_recent_posts_into_social_event() -> None:

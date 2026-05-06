@@ -348,6 +348,33 @@ def test_environment_overrides_yaml(monkeypatch) -> None:
     assert settings.venues.native_asset_rpc["ethereum"].max_retries == 3
 
 
+def test_environment_overrides_decode_json_lists_for_nested_acquisition_sources(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "SIGNALENGINE_ACQUISITION__LAUNCH_ALPHA_SOURCES__MAIN__DEX_ALLOWLIST",
+        '["raydium"]',
+    )
+    monkeypatch.setenv(
+        "SIGNALENGINE_ACQUISITION__CATALYST_ALPHA_SOURCES__BINANCE_LISTING__ENABLED",
+        "true",
+    )
+    monkeypatch.setenv(
+        "SIGNALENGINE_ACQUISITION__CATALYST_ALPHA_SOURCES__BINANCE_LISTING__PROVIDER",
+        "binance_cms_api",
+    )
+    monkeypatch.setenv(
+        "SIGNALENGINE_ACQUISITION__CATALYST_ALPHA_SOURCES__BINANCE_LISTING__SOURCE_URL",
+        "https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/85?pageNo=1&pageSize=20",
+    )
+
+    settings = AppSettings.load()
+
+    assert settings.acquisition.launch_alpha_sources["main"].dex_allowlist == ["raydium"]
+    assert (
+        settings.acquisition.catalyst_alpha_sources["binance_listing"].source_url
+        == "https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/85?pageNo=1&pageSize=20"
+    )
+
+
 def test_settings_reject_yaml_live_credentials(tmp_path) -> None:
     settings_path = tmp_path / "settings.yaml"
     settings_path.write_text(

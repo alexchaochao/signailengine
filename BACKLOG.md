@@ -38,13 +38,11 @@ The following has been implemented since Phase 1:
 
 The active engineering focus is now on:
 
-- **Measurement profile persistence** — registry is in-memory only; survive worker restart via Redis or Postgres
 - **Holder growth aggregator** — listed in data-acquisition plan but not yet implemented
-- **Wallet inflow/outflow scoring** — feature aggregator skeleton exists, not wired end-to-end
 - **Social discovery mode** — continuous broad social monitoring (not just event-triggered confirmation)
 - **Execution rate-limiting / position sizing** — production guards on top of paper defaults
 - **Alibaba Cloud production infra** — docs exist, actual deployment / secrets / domain not configured
-- **CI pipeline hardening** — placeholder workflow exists but does not run all tests
+- **CI pipeline hardening** — workflow runs pytest / ruff / mypy, but does not yet exercise the full integration matrix
 - **End-to-end integration tests** — most coverage is unit-level; no full Redis+Postgres integration tests
 
 ---
@@ -151,9 +149,7 @@ Exit criteria:
 
 | ID | Title | Priority |
 | --- | --- | --- |
-| BKL-027 | Measurement profile persistence | P0 |
 | BKL-028 | Holder growth aggregator | P1 |
-| BKL-029 | Wallet inflow/outflow scoring | P1 |
 | BKL-030 | Social continuous discovery mode | P1 |
 | BKL-031 | Execution rate-limiting & position sizing | P1 |
 | BKL-032 | End-to-end integration tests | P1 |
@@ -190,14 +186,12 @@ Exit criteria:
 
 ### Phase 3 (next)
 
-6. **BKL-027** → profile registry persisted across worker restarts
-7. **BKL-028** → holder growth from trade windows
-8. **BKL-029** → wallet inflow/outflow from on-chain data
-9. **BKL-031** → live execution hardening (rate limits, sizing checks)
-10. **BKL-030** → continuous social monitoring (beyond event-triggered confirmation)
-11. **BKL-032** → end-to-end integration coverage
-12. **BKL-033** → CI that runs the full test suite
-13. **BKL-034** → production deployment to Alibaba Cloud
+6. **BKL-028** → holder growth from trade windows
+7. **BKL-031** → live execution hardening (rate limits, sizing checks)
+8. **BKL-030** → continuous social monitoring (beyond event-triggered confirmation)
+9. **BKL-032** → end-to-end integration coverage
+10. **BKL-033** → CI that runs the full integration matrix
+11. **BKL-034** → production deployment to Alibaba Cloud
 
 ---
 
@@ -251,9 +245,9 @@ Exit criteria:
 | BKL-024 | Unified alpha architecture document | 2 | P0 | 0.5d | complete |
 | BKL-025 | Social LLM pipeline document | 2 | P0 | 0.5d | complete |
 | BKL-026 | Dynamic on-chain measurement profiles | 2 | P2 | 2d | complete |
-| BKL-027 | Measurement profile persistence | 3 | P0 | 1.5d | open |
+| BKL-027 | Measurement profile persistence | 3 | P0 | 1.5d | complete |
 | BKL-028 | Holder growth aggregator | 3 | P1 | 1d | open |
-| BKL-029 | Wallet inflow/outflow scoring | 3 | P1 | 1d | open |
+| BKL-029 | Wallet inflow/outflow scoring | 3 | P1 | 1d | complete |
 | BKL-030 | Social continuous discovery mode | 3 | P1 | 2d | open |
 | BKL-031 | Execution rate-limiting & position sizing | 3 | P1 | 1.5d | open |
 | BKL-032 | End-to-end integration tests | 3 | P1 | 2d | open |
@@ -311,7 +305,7 @@ Exit criteria:
 | --- | --- | --- | --- | --- | --- |
 | BKL-027 | Measurement profile persistence | 3 | P0 | 1.5d | complete |
 | BKL-028 | Holder growth aggregator | 3 | P1 | 1d | open |
-| BKL-029 | Wallet inflow/outflow scoring | 3 | P1 | 1d | open |
+| BKL-029 | Wallet inflow/outflow scoring | 3 | P1 | 1d | complete |
 | BKL-030 | Social continuous discovery mode | 3 | P1 | 2d | open |
 | BKL-031 | Execution rate-limiting & position sizing | 3 | P1 | 1.5d | open |
 | BKL-032 | End-to-end integration tests | 3 | P1 | 2d | open |

@@ -64,7 +64,10 @@ class Router:
                     state,
                     VenueType.DEX,
                     ActionType.BUY,
-                    _suggest_notional(signal.alpha_score),
+                    _suggest_notional(
+                        signal.alpha_score,
+                        liquidity_usd=float(signal.features.get("liquidity_usd", 0.0)),
+                    ),
                 ),
             )
 
@@ -80,7 +83,10 @@ class Router:
                     state,
                     VenueType.CEX,
                     ActionType.BUY,
-                    _suggest_notional(signal.alpha_score),
+                    _suggest_notional(
+                        signal.alpha_score,
+                        liquidity_usd=float(signal.features.get("liquidity_usd", 0.0)),
+                    ),
                 ),
             )
 
@@ -132,5 +138,16 @@ def _select_venue(chain: str, venue_type: VenueType) -> str:
     return "evm_primary"
 
 
-def _suggest_notional(alpha_score: float) -> float:
-    return round(max(alpha_score - 0.5, 0.0) * 5000, 2)
+def _suggest_notional(alpha_score: float, liquidity_usd: float = 0.0) -> float:
+    """Suggest a target notional based on alpha score and available liquidity.
+
+    For high-liquidity tokens the notional grows with alpha score up to 2 % of
+    the available liquidity.  For unknown-liquidity tokens a fixed floor is used.
+    """
+    if liquidity_usd > 0:
+        # Scale notional up to 2 % of available liquidity, modulated by score.
+        # Example: alpha=0.70, liquidity=$200K → $2,800.
+        raw = liquidity_usd * max(alpha_score - 0.5, 0.0) * 0.02
+    else:
+        raw = max(alpha_score - 0.5, 0.0) * 5000
+    return round(raw, 2)

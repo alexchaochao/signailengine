@@ -14,10 +14,23 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
 
-        for attribute in ("correlation_id", "event_id", "token", "chain", "service", "outcome"):
+        for attribute in (
+            "correlation_id",
+            "event_id",
+            "token",
+            "chain",
+            "service",
+            "outcome",
+            "provider",
+            "source_url",
+            "error_type",
+        ):
             value = getattr(record, attribute, None)
             if value is not None:
                 payload[attribute] = value
+
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
 
         return json.dumps(payload)
 

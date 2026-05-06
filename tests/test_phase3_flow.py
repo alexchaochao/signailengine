@@ -2,7 +2,13 @@ from datetime import UTC, datetime
 
 from core.config import AppSettings
 from core.router import Router
-from core.schemas import PortfolioSnapshot, PositionState, TokenState, VenueStatus, VenueType
+from core.schemas import (
+    PortfolioSnapshot,
+    PositionState,
+    TokenState,
+    VenueStatus,
+    VenueType,
+)
 from core.signal_engine import SignalEngine
 from core.state_engine import StateEngine
 from portfolio.risk_engine import RiskEngine
@@ -157,3 +163,106 @@ def test_risk_engine_rejects_low_liquidity_signal() -> None:
 
     assert decision.allowed is False
     assert "liquidity_below_minimum" in decision.violations
+
+
+def test_risk_engine_rejects_zero_notional_buy() -> None:
+    settings = AppSettings.load()
+    signal_engine = SignalEngine()
+    state_engine = StateEngine()
+    router = Router()
+    risk_engine = RiskEngine()
+    observed_at = datetime.now(UTC)
+
+    signal = signal_engine.build_signal(
+        build_onchain_event(
+            {
+                "token": "BONK",
+                "observed_at": observed_at,
+                "liquidity_usd": 180_000,
+                "volume_5m_usd": 60_000,
+                "buy_pressure": 0.82,
+                "estimated_slippage_bps": 90,
+            }
+        ),
+        build_wallet_event(
+            {
+                "token": "BONK",
+                "observed_at": observed_at,
+                "wallet_inflow_score": 0.70,
+            }
+        ),
+    )
+
+    transition = state_engine.transition(
+        TokenState.UNKNOWN,
+        signal,
+        seconds_since_last_transition=120,
+    )
+    route = router.route(signal, transition, PositionState(), VenueStatus())
+    assert route.intent is not None
+
+    decision = risk_engine.evaluate(
+        settings,
+        signal,
+        route.intent,
+        PositionState(),
+        PortfolioSnapshot(total_portfolio_usd=0.0, token_exposure=0.0, chain_exposure=0.0),
+    )
+
+    assert decision.allowed is False
+    assert decision.adjusted_notional_usd == 0.0
+    assert "notional_below_minimum" in decision.violations
+
+
+def test_risk_engine_rejects_buy_during_cooldown() -> None:
+    settings = AppSettings.load()
+    signal_engine = SignalEngine()
+    state_engine = StateEngine()
+    router = Router()
+    risk_engine = RiskEngine()
+    observed_at = datetime.now(UTC)
+
+    signal = signal_engine.build_signal(
+        build_onchain_event(
+            {
+                "token": "BONK",
+                "observed_at": observed_at,
+                "liquidity_usd": 180_000,
+                "volume_5m_usd": 60_000,
+                "buy_pressure": 0.82,
+                "estimated_slippage_bps": 90,
+            }
+        ),
+        build_wallet_event(
+            {
+                "token": "BONK",
+                "observed_at": observed_at,
+                "wallet_inflow_score": 0.70,
+            }
+        ),
+    )
+
+    transition = state_engine.transition(
+        TokenState.UNKNOWN,
+        signal,
+        seconds_since_last_transition=120,
+    )
+    route = router.route(signal, transition, PositionState(), VenueStatus())
+    assert route.intent is not None
+
+    just_exited = PositionState(
+        is_open=False,
+        venue_type=VenueType.NO_TRADE,
+        token_exposure=0.0,
+        last_exit_timestamp=int(datetime.now(UTC).timestamp()) - 60,
+    )
+    decision = risk_engine.evaluate(
+        settings,
+        signal,
+        route.intent,
+        just_exited,
+        PortfolioSnapshot(total_portfolio_usd=10_000, token_exposure=0.0, chain_exposure=0.0),
+    )
+
+    assert decision.allowed is False
+    assert "cooldown_active" in decision.violations

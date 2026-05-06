@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,10 @@ class RiskConfig(BaseModel):
     min_volume_5m_usd: float = 25000
     max_slippage_bps: int = 150
     live_trading_enabled: bool = False
+    # Minimum seconds between two consecutive state transitions for the same
+    # token.  A higher value reduces state-flapping but also delays reaction
+    # to fast-moving tokens.  New-launch tokens need a lower value (≈30s).
+    min_transition_interval_seconds: int = 30
 
 
 class ExecutionConfig(BaseModel):
@@ -622,6 +627,13 @@ def _read_environment(prefix: str) -> dict[str, Any]:
 
 
 def _coerce_env_value(value: str) -> Any:
+    stripped = value.strip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
     lowered = value.lower()
 
     if lowered in {"true", "false"}:

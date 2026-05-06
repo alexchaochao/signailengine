@@ -47,7 +47,8 @@ class RiskEngine:
         violations.extend(_exposure_policy(context))
         violations.extend(_operational_policy(context))
         sized_notional, warnings = _size_notional(context)
-        allowed = not violations and sized_notional >= 0
+        violations.extend(_post_sizing_policy(context, sized_notional))
+        allowed = not violations
 
         return RiskDecision(
             intent_id=intent.intent_id,
@@ -61,6 +62,7 @@ class RiskEngine:
 
 def _operational_policy(context: RiskEvaluationContext) -> list[str]:
     violations: list[str] = []
+    now_timestamp = int(datetime.now(UTC).timestamp())
 
     if context.settings.live.rollout.global_kill_switch_enabled:
         violations.append("global_kill_switch_enabled")
@@ -95,6 +97,16 @@ def _operational_policy(context: RiskEvaluationContext) -> list[str]:
             and not context.position.is_open
         ):
             violations.append("position_preflight_no_open_position")
+
+    if (
+        context.intent.action == ActionType.BUY
+        and not context.position.is_open
+        and context.position.last_exit_timestamp is not None
+    ):
+        cooldown_seconds = context.settings.risk.cooldown_minutes * 60
+        elapsed_seconds = max(now_timestamp - context.position.last_exit_timestamp, 0)
+        if elapsed_seconds < cooldown_seconds:
+            violations.append("cooldown_active")
 
     if (
         context.settings.runtime.environment == "live"
@@ -200,6 +212,14 @@ def _size_notional(context: RiskEvaluationContext) -> tuple[float, list[str]]:
         warnings.append("notional_reduced_by_headroom")
 
     return sized_notional, warnings
+
+
+def _post_sizing_policy(context: RiskEvaluationContext, sized_notional: float) -> list[str]:
+    if context.intent.action != ActionType.BUY:
+        return []
+    if sized_notional <= 0:
+        return ["notional_below_minimum"]
+    return []
 
 
 def _has_live_dex_credentials(settings: AppSettings) -> bool:

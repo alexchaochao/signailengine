@@ -24,6 +24,15 @@ def build_wallet_event(payload: dict[str, Any], source: str = "wallet_tracker") 
 		"tracked_wallet_count": int(payload.get("tracked_wallet_count", 0)),
 	}
 
+	if "sample_count" in payload:
+		normalized_payload["sample_count"] = int(payload.get("sample_count", 0))
+	if "quality_flag" in payload:
+		normalized_payload["quality_flag"] = str(payload.get("quality_flag", ""))
+	if "registry_version" in payload:
+		normalized_payload["registry_version"] = str(payload.get("registry_version", ""))
+	if "freshness_seconds" in payload:
+		normalized_payload["freshness_seconds"] = float(payload.get("freshness_seconds", 0.0))
+
 	return EventEnvelope(
 		event_id=str(payload.get("event_id", uuid4())),
 		event_type="wallet.cluster_snapshot",
@@ -48,6 +57,10 @@ def build_wallet_event_from_snapshot(
 			"wallet_inflow_score": snapshot.wallet_inflow_score,
 			"wallet_outflow_score": snapshot.wallet_outflow_score,
 			"tracked_wallet_count": snapshot.tracked_wallet_count,
+			"sample_count": snapshot.sample_count,
+			"quality_flag": snapshot.quality_flag,
+			"registry_version": snapshot.registry_version,
+			"freshness_seconds": snapshot.freshness_seconds,
 		},
 		source=source,
 	)

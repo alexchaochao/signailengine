@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from math import log10
 from time import sleep
@@ -14,6 +15,22 @@ from sentinel.social_llm import SocialLlmAnalysis
 from sentinel.social_listener import build_reddit_event, build_x_event
 
 SocialHttpTransport = Callable[[str, dict[str, str], float], dict[str, Any]]
+CASHTAG_PATTERN = re.compile(r"\$([A-Za-z][A-Za-z0-9]{1,9})")
+UPPER_TOKEN_PATTERN = re.compile(r"\b[A-Z][A-Z0-9]{1,9}\b")
+TOKEN_STOPWORDS = {
+    "AND",
+    "ARE",
+    "FOR",
+    "FROM",
+    "JUST",
+    "NEW",
+    "NOW",
+    "OR",
+    "SOON",
+    "THE",
+    "THIS",
+    "USD",
+}
 
 
 class RedditSnapshotSource:
@@ -57,12 +74,21 @@ class RedditSnapshotSource:
 
         latest_post = max(filtered, key=lambda post: float(post.get("created_utc", 0.0) or 0.0))
         observed_at = datetime.fromtimestamp(float(latest_post.get("created_utc", 0.0) or 0.0), UTC)
+        resolved_query = _resolve_query(self.config)
+        token = _event_token(
+            self.config,
+            _reddit_discovery_texts(filtered),
+            fallback_query=resolved_query,
+        )
+        if token is None:
+            return []
         event = build_reddit_event(
             {
-                "event_id": self._build_event_id(filtered),
-                "token": _required_token(self.config),
-                "chain": _required_chain(self.config),
-                "query": _resolve_query(self.config),
+                "event_id": self._build_event_id(filtered, token=token),
+                "token": token,
+                "chain": self.config.chain or "unknown",
+                "query": resolved_query,
+                "retrieval_mode": _retrieval_mode(self.config),
                 "observed_at": observed_at,
                 "thread_count": mention_count,
                 "author_count": unique_authors,
@@ -114,11 +140,11 @@ class RedditSnapshotSource:
         age_seconds = (datetime.now(UTC) - datetime.fromtimestamp(created_utc, UTC)).total_seconds()
         return age_seconds <= self.config.max_snapshot_age_seconds
 
-    def _build_event_id(self, posts: list[dict[str, Any]]) -> str:
+    def _build_event_id(self, posts: list[dict[str, Any]], *, token: str) -> str:
         latest_created_utc = int(max(float(post.get("created_utc", 0.0) or 0.0) for post in posts))
         latest_post_id = str(max(posts, key=lambda post: float(post.get("created_utc", 0.0) or 0.0)).get("id", "unknown"))
         return (
-            f"reddit:{self.config.subreddit}:{_required_token(self.config)}:{latest_created_utc}:"
+            f"reddit:{self.config.subreddit}:{token}:{latest_created_utc}:"
             f"{latest_post_id}:{len(posts)}"
         )
 
@@ -164,12 +190,21 @@ class XSnapshotSource:
 
         latest_record = max(filtered, key=_x_created_timestamp)
         observed_at = _coerce_social_datetime(latest_record.get("created_at"))
+        resolved_query = _resolve_query(self.config)
+        token = _event_token(
+            self.config,
+            _x_discovery_texts(filtered),
+            fallback_query=resolved_query,
+        )
+        if token is None:
+            return []
         event = build_x_event(
             {
-                "event_id": self._build_event_id(filtered),
-                "token": _required_token(self.config),
-                "chain": _required_chain(self.config),
-                "query": _resolve_query(self.config),
+                "event_id": self._build_event_id(filtered, token=token),
+                "token": token,
+                "chain": self.config.chain or "unknown",
+                "query": resolved_query,
+                "retrieval_mode": _retrieval_mode(self.config),
                 "observed_at": observed_at,
                 "mention_count": mention_count,
                 "unique_authors": unique_authors,
@@ -223,17 +258,41 @@ class XSnapshotSource:
         age_seconds = (datetime.now(UTC) - observed_at).total_seconds()
         return age_seconds <= self.config.max_snapshot_age_seconds
 
-    def _build_event_id(self, records: list[dict[str, Any]]) -> str:
+    def _build_event_id(self, records: list[dict[str, Any]], *, token: str) -> str:
         latest_record = max(records, key=_x_created_timestamp)
         latest_timestamp = int(_x_created_timestamp(latest_record))
         latest_post_id = str(latest_record.get("id", "unknown"))
         query_key = _resolve_query(self.config)
-        return f"x:{query_key}:{_required_token(self.config)}:{latest_timestamp}:{latest_post_id}:{len(records)}"
+        return f"x:{query_key}:{token}:{latest_timestamp}:{latest_post_id}:{len(records)}"
 
 
 def build_social_live_sources(settings: AppSettings) -> list[RedditSnapshotSource | XSnapshotSource]:
-    _ = settings
-    return []
+    """Build social discovery sources from configured social_sources.
+
+    Each enabled source with a valid provider is instantiated as a polling
+    snapshot source.  These run in the ``--social-live`` worker and emit
+    ``social.signal_snapshot`` events into the raw-event stream.
+
+    Note: discovery-mode sources do not carry a specific token — the query,
+    subreddit or platform-level config determines what is polled.  Token-
+    specific queries belong to confirmation mode (see
+    :func:`build_social_confirmation_source`).
+    """
+    acquisition = AcquisitionConfig.model_validate(settings.acquisition)
+    sources: list[RedditSnapshotSource | XSnapshotSource] = []
+    for source_key, source_config in sorted(acquisition.social_sources.items()):
+        config = source_config.model_copy(
+            update={"source_name": source_config.source_name or f"social_{source_key}"}
+        )
+        if not config.enabled:
+            continue
+        if config.provider == "reddit_search_json":
+            sources.append(RedditSnapshotSource(settings, config))
+        elif config.provider == "x_snapshot_json":
+            sources.append(XSnapshotSource(settings, config))
+        else:
+            raise ValueError(f"unsupported_social_provider:{config.provider}")
+    return sources
 
 
 def build_social_confirmation_source(
@@ -460,16 +519,70 @@ def _resolve_query(config: SocialLiveSourceConfig) -> str:
     if not template:
         raise ValueError("social_query_missing")
     replacements = {
-        "token": _required_token(config),
-        "chain": _required_chain(config),
-        "query": config.query or _required_token(config),
-        "cashtag": f"${_required_token(config)}",
+        "token": config.token,
+        "chain": config.chain,
+        "query": config.query or config.token,
+        "cashtag": f"${config.token}" if config.token else None,
     }
     rendered = str(template)
     for key, value in replacements.items():
+        if value is None:
+            continue
         rendered = rendered.replace(f"${{{key}}}", value)
         rendered = rendered.replace(f"{{{key}}}", value)
     return rendered
+
+
+def _event_token(
+    config: SocialLiveSourceConfig,
+    texts: list[str],
+    *,
+    fallback_query: str,
+) -> str | None:
+    if config.token:
+        return config.token
+    candidates = _extract_candidate_tokens([*texts, fallback_query])
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _retrieval_mode(config: SocialLiveSourceConfig) -> str:
+    return "discovery" if not config.token else "confirmation"
+
+
+def _extract_candidate_tokens(texts: list[str]) -> list[str]:
+    counts: dict[str, int] = {}
+    for text in texts:
+        for match in CASHTAG_PATTERN.findall(text):
+            token = match.upper()
+            counts[token] = counts.get(token, 0) + 2
+        for match in UPPER_TOKEN_PATTERN.findall(text):
+            token = match.upper()
+            if token in TOKEN_STOPWORDS:
+                continue
+            counts[token] = counts.get(token, 0) + 1
+    return [token for token, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
+
+
+def _reddit_discovery_texts(posts: list[dict[str, Any]]) -> list[str]:
+    texts: list[str] = []
+    for post in posts:
+        for key in ("title", "selftext", "body", "text"):
+            value = str(post.get(key, "")).strip()
+            if value:
+                texts.append(value)
+    return texts
+
+
+def _x_discovery_texts(records: list[dict[str, Any]]) -> list[str]:
+    texts: list[str] = []
+    for record in records:
+        for key in ("text", "full_text", "body"):
+            value = str(record.get(key, "")).strip()
+            if value:
+                texts.append(value)
+    return texts
 
 
 def _required_token(config: SocialLiveSourceConfig) -> str:

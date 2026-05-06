@@ -1061,40 +1061,35 @@ def build_live_sources(
 ) -> list[object]:
     acquisition = AcquisitionConfig.model_validate(settings.acquisition)
     sources: list[object] = []
+    seen_keys: set[tuple[str, str, str]] = set()  # (chain, token, source_kind) dedup
+
+    def _source_kind(source: object) -> str:
+        """Derive a source-kind label for dedup — two sources of the same kind
+        for the same (chain, token) are redundant; different kinds are not."""
+        if isinstance(source, (JupiterQuoteSource, EvmQuoteSource)):
+            return "quote"
+        if isinstance(source, SolanaWalletTradeSource):
+            return "rpc_trade"
+        if isinstance(source, EvmTransferTradeSource):
+            return "transfer_trade"
+        if isinstance(source, EvmPoolSwapTradeSource):
+            return "pool_swap_trade"
+        return "unknown"
+
+    def _dedup_add(source: object, chain: str, token: str) -> None:
+        key = (chain, token, _source_kind(source))
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        sources.append(source)
 
     # 1. Registry-based profiles (event-driven measurement)
     if registry is not None:
         for profile in registry.active_profiles():
             source = _build_source_from_profile(settings, profile)
             if source is not None:
-                sources.append(source)
+                _dedup_add(source, profile.chain, profile.token)
 
-    # 2. Static acquisition config (explicitly configured measurement routes)
-    if acquisition.solana_wallet_trade.enabled and _is_complete_solana_trade_source(
-        acquisition.solana_wallet_trade
-    ):
-        sources.append(SolanaWalletTradeSource(settings, acquisition.solana_wallet_trade))
-    if acquisition.jupiter_quote.enabled and _is_complete_jupiter_quote_source(
-        acquisition.jupiter_quote
-    ):
-        sources.append(JupiterQuoteSource(settings, acquisition.jupiter_quote))
-    for source_key, source_config in sorted(resolve_evm_routes(acquisition).items()):
-        config = source_config.model_copy(
-            update={
-                "source_name": source_config.source_name or f"evm_{source_key}",
-                "checkpoint_key": source_config.checkpoint_key or f"acquisition:evm_sources:{source_key}",
-            }
-        )
-        if not config.enabled or not _is_complete_evm_source(config):
-            continue
-        if config.source_type == "transfer_trade":
-            sources.append(EvmTransferTradeSource(settings, config))
-        elif config.source_type == "pool_swap_trade":
-            sources.append(EvmPoolSwapTradeSource(settings, config))
-        elif config.source_type == "quote":
-            sources.append(EvmQuoteSource(settings, config))
-        else:
-            raise ValueError(f"unsupported_evm_source_type:{config.source_type}")
     return sources
 
 

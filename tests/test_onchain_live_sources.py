@@ -1,73 +1,61 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from core.config import AcquisitionConfig, AppSettings
+from core.schemas import MeasurementProfile
 from execution.solana_rpc import SolanaHttpTransportResponse
 from sentinel.onchain_live_sources import (
     EvmPoolSwapTradeSource,
     EvmQuoteSource,
     EvmTransferTradeSource,
     JupiterQuoteSource,
+    MeasurementProfileRegistry,
     SolanaWalletTradeSource,
     build_live_sources,
 )
 
 
 def test_build_live_sources_returns_enabled_sources() -> None:
-    settings = AppSettings.load().model_copy(
-        update={
-            "acquisition": {
-                "solana_wallet_trade": {
-                    "enabled": True,
-                    "wallet_address": "wallet-1",
-                    "token_mint": "token-mint",
-                    "quote_mint": "quote-mint",
-                },
-                "jupiter_quote": {
-                    "enabled": True,
-                    "input_mint": "usdc-mint",
-                    "output_mint": "bonk-mint",
-                },
-                "evm_transfer_trade": {
-                    "enabled": True,
-                    "chain": "base",
-                    "wallet_address": "0x00000000000000000000000000000000000000aa",
-                    "token_contract": "0x00000000000000000000000000000000000000bb",
-                    "quote_contract": "0x00000000000000000000000000000000000000cc",
-                },
-                "evm_sources": {
-                    "base_quote": {
-                        "enabled": True,
-                        "source_type": "quote",
-                        "chain": "base",
-                        "chain_id": 8453,
-                        "token": "AERO",
-                        "token_contract": "0x00000000000000000000000000000000000000bb",
-                        "quote_contract": "0x00000000000000000000000000000000000000cc",
-                    },
-                    "base_pool": {
-                        "enabled": True,
-                        "source_type": "pool_swap_trade",
-                        "chain": "base",
-                        "token": "AERO",
-                        "pool_address": "0x00000000000000000000000000000000000000dd",
-                        "token_contract": "0x00000000000000000000000000000000000000bb",
-                        "quote_contract": "0x00000000000000000000000000000000000000cc",
-                    },
-                },
-            }
-        }
+    """Sources are built from registered measurement profiles, not static config."""
+    registry = MeasurementProfileRegistry()
+    registry.register(
+        MeasurementProfile(
+            profile_id="test-1",
+            chain="solana",
+            token="BONK",
+            discovery_event_type="alpha.launch_candidate",
+            discovery_event_id="discovery-1",
+            registered_at=datetime.now(UTC),
+            ttl_seconds=3600,
+            token_mint="DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+            quote_mint="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            chain_type="solana",
+        )
+    )
+    registry.register(
+        MeasurementProfile(
+            profile_id="test-2",
+            chain="base",
+            token="AERO",
+            discovery_event_type="alpha.catalyst_candidate",
+            discovery_event_id="discovery-2",
+            registered_at=datetime.now(UTC),
+            ttl_seconds=3600,
+            pool_address="0x00000000000000000000000000000000000000dd",
+            token_contract="0x00000000000000000000000000000000000000bb",
+            quote_contract="0x00000000000000000000000000000000000000cc",
+            chain_type="evm",
+        )
     )
 
-    sources = build_live_sources(settings)
+    settings = AppSettings.load()
+    sources = build_live_sources(settings, registry=registry)
 
-    assert len(sources) == 5
+    assert len(sources) == 2
     assert isinstance(sources[0], SolanaWalletTradeSource)
-    assert isinstance(sources[1], JupiterQuoteSource)
-    assert sum(isinstance(source, EvmTransferTradeSource) for source in sources) == 1
-    assert sum(isinstance(source, EvmPoolSwapTradeSource) for source in sources) == 1
-    assert sum(isinstance(source, EvmQuoteSource) for source in sources) == 1
+    assert isinstance(sources[1], EvmPoolSwapTradeSource)
 
 
 def test_build_live_sources_skips_incomplete_measurement_templates() -> None:
@@ -112,6 +100,13 @@ def test_build_live_sources_skips_incomplete_measurement_templates() -> None:
 
     sources = build_live_sources(settings)
 
+    assert sources == []
+
+
+def test_build_live_sources_returns_empty_without_registry() -> None:
+    """Without a registry, build_live_sources returns empty (static config removed)."""
+    settings = AppSettings.load()
+    sources = build_live_sources(settings)
     assert sources == []
 
 
@@ -1298,28 +1293,20 @@ def test_build_live_sources_includes_registry_profiles() -> None:
     assert profile_sources[0].config.token == "REGTOKEN"
 
 
-def test_build_live_sources_with_empty_registry_returns_static_sources_only() -> None:
+def test_build_live_sources_with_empty_registry_returns_no_sources() -> None:
+    """Without registered profiles, build_live_sources returns empty.
+
+    Static token config is no longer supported — all sources come from
+    measurement profiles (see test_build_live_sources_returns_enabled_sources).
+    """
     from sentinel.onchain_live_sources import MeasurementProfileRegistry
 
-    settings = AppSettings.load().model_copy(
-        update={
-            "acquisition": {
-                "solana_wallet_trade": {
-                    "enabled": True,
-                    "wallet_address": "wallet-1",
-                    "token": "BONK",
-                    "token_mint": "token-mint",
-                    "quote_mint": "quote-mint",
-                },
-            }
-        }
-    )
+    settings = AppSettings.load()
     registry = MeasurementProfileRegistry()
 
     sources = build_live_sources(settings, registry=registry)
 
-    assert len(sources) == 1
-    assert isinstance(sources[0], SolanaWalletTradeSource)
+    assert sources == []
 
 
 # ── Redis-backed MeasurementProfileRegistry ────────────────────────────────
