@@ -27,8 +27,8 @@ class RedisConfig(BaseModel):
 class PostgresConfig(BaseModel):
     url: str = "postgresql+psycopg://signalengine:signalengine@localhost:5432/signalengine"
     echo: bool = False
-    pool_size: int = 5
-    max_overflow: int = 10
+    pool_size: int = 1
+    max_overflow: int = 0
 
 
 class ObservabilityConfig(BaseModel):
@@ -80,6 +80,10 @@ class OnchainFeatureConfig(BaseModel):
     buy_pressure_primary_window: str = "5m"
     min_trade_count_for_buy_pressure: int = 10
     max_trade_lag_seconds: float = 30.0
+    # Trades below this notional (in USD) still produce raw events + aggregator
+    # features but skip publishing an onchain.trade_fact stream event, reducing
+    # noise in the wallet intelligence projection pipeline.
+    min_trade_notional_usd: float = 10.0
 
 
 class SlippageFeatureConfig(BaseModel):
@@ -243,17 +247,6 @@ class LaunchAlphaLiveSourceConfig(BaseModel):
     max_creator_hold_pct: float = 0.2
 
 
-class CatalystTokenMatcherConfig(BaseModel):
-    token: str
-    chain: str
-    aliases: list[str] = Field(default_factory=list)
-    catalyst_type: str = "cex_listing_announcement"
-    venue: str | None = None
-    impact_score: float = 0.82
-    credibility_score: float = 0.9
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
 class CatalystAlphaLiveSourceConfig(BaseModel):
     enabled: bool = False
     provider: str = "rss_keyword_feed"
@@ -270,7 +263,13 @@ class CatalystAlphaLiveSourceConfig(BaseModel):
     excluded_keywords: list[str] = Field(
         default_factory=lambda: ["delist", "removal", "maintenance", "suspend"]
     )
-    token_configs: list[CatalystTokenMatcherConfig] = Field(default_factory=list)
+    venue: str | None = None
+    default_chain: str = "unknown"
+    default_catalyst_type: str = "cex_listing_announcement"
+    impact_score: float = 0.82
+    credibility_score: float = 0.9
+    extraction_mode: str = "llm_with_heuristic_fallback"
+    extraction_max_entities: int = 3
 
 
 class FlowAlphaBackfillConfig(BaseModel):
@@ -280,7 +279,7 @@ class FlowAlphaBackfillConfig(BaseModel):
 
 class FlowAlphaLiveSourceConfig(BaseModel):
     enabled: bool = False
-    observe_only: bool = False
+    observe_only: bool = True
     provider: str = "wallet_intelligence_store"
     source_name: str | None = None
     chain: str = "solana"
@@ -292,6 +291,31 @@ class FlowAlphaLiveSourceConfig(BaseModel):
     min_smart_money_inflow_usd: float = 40_000.0
     min_unique_buyer_wallets_15m: int = 4
     min_exchange_outflow_usd: float = 0.0
+
+
+class SocialLiveSourceConfig(BaseModel):
+    enabled: bool = False
+    provider: str = "reddit_search_json"
+    source_name: str | None = None
+    platform: str = "x"
+    chain: str | None = None
+    token: str | None = None
+    query: str | None = None
+    query_template: str | None = None
+    query_param_name: str = "q"
+    source_url: str | None = None
+    subreddit: str = "CryptoMoonShots"
+    sort: str = "new"
+    limit: int = 25
+    timeout_seconds: float = 5.0
+    retry_attempts: int = 2
+    retry_backoff_seconds: float = 0.5
+    max_snapshot_age_seconds: float = 300.0
+    min_sentiment_score: float = 0.0
+    min_velocity_score: float = 0.0
+    min_mentions: int = 1
+    min_unique_authors: int = 1
+    user_agent: str = "signalengine/0.1"
 
 
 class AcquisitionConfig(BaseModel):
@@ -312,6 +336,7 @@ class AcquisitionConfig(BaseModel):
     launch_alpha_sources: dict[str, LaunchAlphaLiveSourceConfig] = Field(default_factory=dict)
     catalyst_alpha_sources: dict[str, CatalystAlphaLiveSourceConfig] = Field(default_factory=dict)
     flow_alpha_sources: dict[str, FlowAlphaLiveSourceConfig] = Field(default_factory=dict)
+    social_sources: dict[str, SocialLiveSourceConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def synchronize_evm_route_registries(self) -> "AcquisitionConfig":
@@ -448,7 +473,7 @@ class WalletIntelligenceSyncConfig(BaseModel):
     enabled: bool = False
     chain: str = "solana"
     chain_index: str = "501"
-    token: str = "BONK"
+    measurement_token: str = "BONK"
     time_frame: str = "3"
     sort_by: str = "1"
     wallet_type: str = "3"
@@ -472,6 +497,25 @@ class LiveConfig(BaseModel):
     wallet_intelligence: WalletIntelligenceSyncConfig = Field(
         default_factory=WalletIntelligenceSyncConfig
     )
+
+
+class LlmConfig(BaseModel):
+    enabled: bool = False
+    provider: str = "heuristic"
+    model: str = "gpt-5.4"
+    api_key: str | None = None
+    base_url: str | None = None
+    timeout_seconds: float = 8.0
+    temperature: float = 0.0
+    max_evidence_texts: int = 6
+    max_summary_chars: int = 280
+
+    @field_validator("provider", "model", "api_key", "base_url", mode="before")
+    @classmethod
+    def coerce_llm_strings(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return str(value)
 
 
 class VenueConfig(BaseModel):
@@ -516,6 +560,7 @@ class AppSettings(BaseModel):
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     acquisition: AcquisitionConfig = Field(default_factory=AcquisitionConfig)
     live: LiveConfig = Field(default_factory=LiveConfig)
+    llm: LlmConfig = Field(default_factory=LlmConfig)
     venues: VenueConfig = Field(default_factory=VenueConfig)
 
     @classmethod

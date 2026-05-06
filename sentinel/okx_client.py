@@ -26,7 +26,7 @@ class OkxApiCredentials:
     project_id: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class OkxTransportError(RuntimeError):
     reason: str
     status_code: int | None = None
@@ -42,7 +42,7 @@ class OkxTransportError(RuntimeError):
         RuntimeError.__init__(self, self.reason)
 
 
-@dataclass(frozen=True)
+@dataclass
 class OkxRequestError(RuntimeError):
     method: str
     request_path: str

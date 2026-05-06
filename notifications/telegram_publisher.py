@@ -9,6 +9,7 @@ from redis import Redis
 
 from core.config import AppSettings, NotificationsConfig
 from core.schemas import EventEnvelope
+from infra.metrics import Metrics
 from infra.redis_stream import acknowledge_message, ensure_consumer_group, read_group_models
 from infra.repository import StorageRepository
 
@@ -24,12 +25,14 @@ class TelegramPublisherService:
         *,
         transport: TelegramTransport | None = None,
         logger: Logger | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         self.settings = settings
         self.redis_client = redis_client
         self.repository = repository
         self.transport = transport or _send_telegram_message
         self.logger = logger or getLogger("signalengine.telegram_publisher")
+        self.metrics = metrics or Metrics(settings.observability.service_namespace)
 
     def ensure_stream(self) -> None:
         config = _notifications_config(self.settings).telegram
@@ -43,6 +46,7 @@ class TelegramPublisherService:
         config = _notifications_config(self.settings).telegram
         if not config.enabled:
             return 0
+        self.metrics.mark_heartbeat(service="telegram_publisher", mode="process_once")
         events = read_group_models(
             self.redis_client,
             self.settings.redis.raw_events_stream,
@@ -109,6 +113,7 @@ class TelegramPublisherService:
                 payload=event.model_dump(mode="json"),
                 error_message=f"unsupported_alpha_type:{alpha_type}",
             )
+            self.metrics.notification_deliveries.labels(channel="telegram", status="skipped").inc()
             return
 
         if score < config.min_score:
@@ -121,6 +126,7 @@ class TelegramPublisherService:
                 payload=event.model_dump(mode="json"),
                 error_message=f"score_below_min:{score}",
             )
+            self.metrics.notification_deliveries.labels(channel="telegram", status="skipped").inc()
             return
 
         remote_message_id = self.transport(
@@ -138,6 +144,7 @@ class TelegramPublisherService:
             remote_message_id=remote_message_id,
             delivered_at=datetime.now(UTC),
         )
+        self.metrics.notification_deliveries.labels(channel="telegram", status="sent").inc()
 
     def _record_failed_delivery(self, event: EventEnvelope, error_message: str) -> None:
         if event.event_type != "alpha.candidate_qualified":
@@ -155,6 +162,7 @@ class TelegramPublisherService:
             payload=event.model_dump(mode="json"),
             error_message=error_message,
         )
+        self.metrics.notification_deliveries.labels(channel="telegram", status="failed").inc()
 
     def _format_qualified_candidate_message(self, event: EventEnvelope) -> str:
         lines = _base_qualified_candidate_message_lines(event)

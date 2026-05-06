@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from discovery.schemas import AlphaCandidate, AlphaCandidateStatus, AlphaType, LaunchPoolSnapshot
+
+if TYPE_CHECKING:
+    from core.config import LaunchAlphaLiveSourceConfig
 
 
 @dataclass(frozen=True)
@@ -13,6 +17,24 @@ class LaunchAlphaThresholds:
     min_unique_wallets_5m: int = 5
     min_liquidity_lock_ratio: float = 0.8
     max_creator_hold_pct: float = 0.2
+
+    @classmethod
+    def from_source_config(
+        cls, source_config: LaunchAlphaLiveSourceConfig
+    ) -> LaunchAlphaThresholds:
+        """Create thresholds from the env-configurable source config layer.
+
+        Respects the values defined in LaunchAlphaLiveSourceConfig, which is
+        populated by SIGNALENGINE_ACQUISITION__LAUNCH_ALPHA_SOURCES__* env vars.
+        """
+        return cls(
+            min_initial_liquidity_usd=source_config.min_initial_liquidity_usd,
+            min_buy_notional_5m_usd=source_config.min_buy_notional_5m_usd,
+            min_trade_count_5m=source_config.min_trade_count_5m,
+            min_unique_wallets_5m=source_config.min_unique_wallets_5m,
+            min_liquidity_lock_ratio=source_config.min_liquidity_lock_ratio,
+            max_creator_hold_pct=source_config.max_creator_hold_pct,
+        )
 
 
 class LaunchAlphaScanner:

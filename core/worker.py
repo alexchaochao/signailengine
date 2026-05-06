@@ -2,28 +2,48 @@ from __future__ import annotations
 
 import argparse
 import signal
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from threading import Event
 from time import sleep
 from pathlib import Path
+from typing import Iterator
 
 from core.config import AcquisitionConfig, AppSettings
-from core.schemas import CollectorCheckpoint
+from core.schemas import CollectorCheckpoint, EventEnvelope, SocialQueryRequest
+from discovery.service import SocialConfirmationSyncService
 from discovery.catalyst_live_sources import build_catalyst_live_sources
 from discovery.catalyst_live_sources import InvalidCatalystFeedError
 from discovery.flow_live_sources import build_flow_live_sources
 from discovery.live_sources import build_launch_live_sources
 from discovery.service import CatalystAlphaSyncService
-from discovery.service import FlowAlphaSyncService
+from discovery.service import FlowMeasurementSyncService
 from discovery.service import LaunchAlphaSyncService
 from core.pipeline import PipelineWorker
 from infra.alerts import AlertManager
 from infra.logging import configure_logging, get_logger
 from infra.metrics import Metrics, start_metrics_server
 from infra.postgres import get_engine, init_storage, ping_postgres
-from infra.redis_stream import get_redis_client, ping_redis, replay_dead_letters
+from infra.redis_stream import (
+    acknowledge_message,
+    ensure_consumer_group,
+    get_redis_client,
+    ping_redis,
+    publish_dead_letter,
+    read_group_models,
+    replay_dead_letters,
+)
 from infra.repository import StorageRepository
 from notifications.telegram_publisher import TelegramPublisherService
+from core.event_flow import publish_raw_events
+from sentinel.social_live_sources import build_social_live_sources
+from sentinel.social_live_sources import (
+    build_social_analysis_event,
+    build_social_confirmation_source,
+    build_social_query_requested_event,
+)
+from sentinel.social_llm import build_social_llm_analyzer
+from core.schemas import RawEventRecord
 from sentinel.wallet_intelligence_sync import (
     WalletIntelligenceSyncRequest,
     WalletIntelligenceSyncService,
@@ -33,10 +53,25 @@ from sentinel.onchain_live_sources import (
     EvmPoolSwapTradeSource,
     EvmQuoteSource,
     JupiterQuoteSource,
+    MeasurementProfileRegistry,
     SolanaWalletTradeSource,
     build_live_sources,
+    consume_discovery_events_for_measurement,
 )
 from sentinel.onchain_feature_sync import OnchainFeatureSyncService
+
+
+@contextmanager
+def _storage_repository(settings: AppSettings) -> Iterator[tuple[object, StorageRepository]]:
+    engine = get_engine(settings)
+    init_storage(engine)
+    repository = StorageRepository(engine)
+    try:
+        yield engine, repository
+    finally:
+        dispose = getattr(engine, "dispose", None)
+        if callable(dispose):
+            dispose()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,7 +89,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wallet-flow-project", action="store_true")
     parser.add_argument("--wallet-chain")
     parser.add_argument("--wallet-chain-index")
-    parser.add_argument("--wallet-token")
     parser.add_argument("--wallet-time-frame")
     parser.add_argument("--wallet-sort-by")
     parser.add_argument("--wallet-type")
@@ -67,9 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--launch-alpha-live", action="store_true")
     parser.add_argument("--catalyst-alpha-backfill")
     parser.add_argument("--catalyst-alpha-live", action="store_true")
-    parser.add_argument("--flow-alpha-backfill")
-    parser.add_argument("--flow-alpha-live", action="store_true")
+    parser.add_argument("--flow-measurement-backfill")
+    parser.add_argument("--flow-measurement-live", action="store_true")
     parser.add_argument("--telegram-publisher-live", action="store_true")
+    parser.add_argument("--social-live", action="store_true")
+    parser.add_argument("--social-confirmation-live", action="store_true")
     parser.add_argument("--no-db", action="store_true")
     return parser
 
@@ -95,7 +131,6 @@ def run_wallet_intelligence_sync(
     *,
     chain: str | None = None,
     chain_index: str | None = None,
-    token: str | None = None,
     time_frame: str | None = None,
     sort_by: str | None = None,
     wallet_type: str | None = None,
@@ -105,29 +140,27 @@ def run_wallet_intelligence_sync(
 ) -> int:
     sync_config = settings.live.wallet_intelligence
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = WalletIntelligenceSyncService(settings, redis_client, repository)
-    service.run(
-        WalletIntelligenceSyncRequest(
-            chain=chain or sync_config.chain,
-            chain_index=chain_index or sync_config.chain_index,
-            token=token or sync_config.token,
-            time_frame=time_frame or sync_config.time_frame,
-            sort_by=sort_by or sync_config.sort_by,
-            wallet_type=wallet_type or sync_config.wallet_type,
-            registry_version=sync_config.registry_version,
-            refresh_limit=refresh_limit if refresh_limit is not None else sync_config.refresh_limit,
-            raw_event_count=(
-                raw_event_count
-                if raw_event_count is not None
-                else sync_config.raw_event_batch_size
-            ),
-            raw_event_last_id=raw_event_last_id or "0-0",
-            sync_key=f"wallet_intelligence:{(chain or sync_config.chain)}:{(token or sync_config.token)}",
+    with _storage_repository(settings) as (_, repository):
+        service = WalletIntelligenceSyncService(settings, redis_client, repository)
+        service.run(
+            WalletIntelligenceSyncRequest(
+                chain=chain or sync_config.chain,
+                chain_index=chain_index or sync_config.chain_index,
+                token=sync_config.measurement_token,
+                time_frame=time_frame or sync_config.time_frame,
+                sort_by=sort_by or sync_config.sort_by,
+                wallet_type=wallet_type or sync_config.wallet_type,
+                registry_version=sync_config.registry_version,
+                refresh_limit=refresh_limit if refresh_limit is not None else sync_config.refresh_limit,
+                raw_event_count=(
+                    raw_event_count
+                    if raw_event_count is not None
+                    else sync_config.raw_event_batch_size
+                ),
+                raw_event_last_id=raw_event_last_id or "0-0",
+                sync_key=f"wallet_intelligence:{(chain or sync_config.chain)}:{sync_config.measurement_token}",
+            )
         )
-    )
     return 0
 
 
@@ -136,7 +169,6 @@ def run_wallet_flow_projection(
     *,
     chain: str | None = None,
     chain_index: str | None = None,
-    token: str | None = None,
     time_frame: str | None = None,
     sort_by: str | None = None,
     wallet_type: str | None = None,
@@ -145,29 +177,27 @@ def run_wallet_flow_projection(
 ) -> int:
     sync_config = settings.live.wallet_intelligence
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = WalletIntelligenceSyncService(settings, redis_client, repository)
-    service.project_existing_registry(
-        WalletIntelligenceSyncRequest(
-            chain=chain or sync_config.chain,
-            chain_index=chain_index or sync_config.chain_index,
-            token=token or sync_config.token,
-            time_frame=time_frame or sync_config.time_frame,
-            sort_by=sort_by or sync_config.sort_by,
-            wallet_type=wallet_type or sync_config.wallet_type,
-            registry_version=sync_config.registry_version,
-            refresh_limit=0,
-            raw_event_count=(
-                raw_event_count
-                if raw_event_count is not None
-                else sync_config.raw_event_batch_size
-            ),
-            raw_event_last_id=raw_event_last_id or "0-0",
-            sync_key=f"wallet_intelligence:{(chain or sync_config.chain)}:{(token or sync_config.token)}",
+    with _storage_repository(settings) as (_, repository):
+        service = WalletIntelligenceSyncService(settings, redis_client, repository)
+        service.project_existing_registry(
+            WalletIntelligenceSyncRequest(
+                chain=chain or sync_config.chain,
+                chain_index=chain_index or sync_config.chain_index,
+                token=sync_config.measurement_token,
+                time_frame=time_frame or sync_config.time_frame,
+                sort_by=sort_by or sync_config.sort_by,
+                wallet_type=wallet_type or sync_config.wallet_type,
+                registry_version=sync_config.registry_version,
+                refresh_limit=0,
+                raw_event_count=(
+                    raw_event_count
+                    if raw_event_count is not None
+                    else sync_config.raw_event_batch_size
+                ),
+                raw_event_last_id=raw_event_last_id or "0-0",
+                sync_key=f"wallet_intelligence:{(chain or sync_config.chain)}:{sync_config.measurement_token}",
+            )
         )
-    )
     return 0
 
 
@@ -177,110 +207,119 @@ def run_onchain_feature_backfill(
     input_path: str | Path,
 ) -> int:
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    metrics = Metrics(settings.observability.service_namespace)
-    service = OnchainFeatureSyncService(settings, redis_client, repository, metrics=metrics)
-    service.ingest_jsonl(input_path)
+    with _storage_repository(settings) as (_, repository):
+        metrics = Metrics(settings.observability.service_namespace)
+        service = OnchainFeatureSyncService(settings, redis_client, repository, metrics=metrics)
+        service.ingest_jsonl(input_path)
     return 0
 
 
-def run_onchain_feature_live_sync(settings: AppSettings) -> int:
+def run_onchain_feature_live_sync(
+    settings: AppSettings,
+    *,
+    registry: MeasurementProfileRegistry | None = None,
+) -> int:
     logger = get_logger("signalengine.onchain_feature_live")
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    metrics = Metrics(settings.observability.service_namespace)
-    alert_manager = AlertManager(metrics, logger)
-    service = OnchainFeatureSyncService(settings, redis_client, repository, metrics=metrics)
-    acquisition_config = AcquisitionConfig.model_validate(settings.acquisition)
-    now = datetime.now(UTC)
+    with _storage_repository(settings) as (_, repository):
+        metrics = Metrics(settings.observability.service_namespace)
+        alert_manager = AlertManager(metrics, logger)
+        service = OnchainFeatureSyncService(settings, redis_client, repository, metrics=metrics)
+        acquisition_config = AcquisitionConfig.model_validate(settings.acquisition)
+        now = datetime.now(UTC)
 
-    for source in build_live_sources(settings):
-        source_name = source.config.source_name
-        chain = getattr(source.config, "chain", None)
-        token = getattr(source.config, "token", None)
-        state = _load_live_source_state(repository, source_name)
-        if state.next_eligible_at is not None and now < state.next_eligible_at:
-            metrics.live_source_polls.labels(source=source_name, outcome="cooldown").inc()
-            metrics.live_source_consecutive_failures.labels(source=source_name).set(
-                float(state.consecutive_failures)
-            )
-            metrics.live_source_next_eligible.labels(source=source_name).set(
-                state.next_eligible_at.timestamp()
-            )
-            continue
-        try:
-            if isinstance(source, (SolanaWalletTradeSource, EvmTransferTradeSource, EvmPoolSwapTradeSource)):
-                checkpoint = repository.checkpoints.load(source.config.checkpoint_key)
-                last_cursor = checkpoint.cursor if checkpoint is not None else None
-                records = source.fetch_trades(last_cursor=last_cursor)
-                metrics.live_source_records.labels(
-                    source=source_name,
-                    record_type="onchain_trade",
-                ).inc(len(records))
-                for record in records:
-                    service.ingest_trade(record.payload, source_name=source_name)
-                    repository.checkpoints.save(
-                        CollectorCheckpoint(
-                            checkpoint_key=source.config.checkpoint_key,
-                            cursor=record.cursor,
-                            observed_at=record.observed_at,
-                            metadata={
-                                "source_name": source_name,
-                                "provider": source.config.provider,
-                            },
-                        )
-                    )
-            elif isinstance(source, (JupiterQuoteSource, EvmQuoteSource)):
-                payloads = source.fetch_quotes()
-                metrics.live_source_records.labels(
-                    source=source_name,
-                    record_type="dex_quote",
-                ).inc(len(payloads))
-                for payload in payloads:
-                    service.ingest_quote(payload, source_name=source_name)
-            metrics.live_source_polls.labels(source=source_name, outcome="success").inc()
-            metrics.live_source_last_success.labels(source=source_name).set(datetime.now(UTC).timestamp())
-            metrics.live_source_consecutive_failures.labels(source=source_name).set(0.0)
-            metrics.live_source_next_eligible.labels(source=source_name).set(0.0)
-            _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
-        except Exception:
-            next_failures = state.consecutive_failures + 1
-            next_eligible_at = datetime.now(UTC) + _source_retry_delay(
-                settings.model_copy(update={"acquisition": acquisition_config}),
-                consecutive_failures=next_failures,
-            )
-            _save_live_source_state(
-                repository,
-                source_name,
-                consecutive_failures=next_failures,
-                next_eligible_at=next_eligible_at,
-            )
-            metrics.live_source_polls.labels(source=source_name, outcome="error").inc()
-            metrics.live_source_last_error.labels(source=source_name).set(datetime.now(UTC).timestamp())
-            metrics.live_source_consecutive_failures.labels(source=source_name).set(
-                float(next_failures)
-            )
-            metrics.live_source_next_eligible.labels(source=source_name).set(
-                next_eligible_at.timestamp()
-            )
-            if next_failures == settings.observability.max_consecutive_live_source_failures:
-                alert_manager.emit(
-                    "live_source_failure_threshold_exceeded",
-                    token=token,
-                    chain=chain,
-                    details={"outcome": source_name},
+        # Consume discovery events to register dynamic measurement profiles
+        consumer_registry = registry or MeasurementProfileRegistry()
+        consume_discovery_events_for_measurement(
+            redis_client,
+            settings,
+            consumer_registry,
+            count=20,
+        )
+
+        for source in build_live_sources(settings, registry=consumer_registry):
+            source_name = source.config.source_name
+            chain = getattr(source.config, "chain", None)
+            token = getattr(source.config, "token", None)
+            state = _load_live_source_state(repository, source_name)
+            if state.next_eligible_at is not None and now < state.next_eligible_at:
+                metrics.live_source_polls.labels(source=source_name, outcome="cooldown").inc()
+                metrics.live_source_consecutive_failures.labels(source=source_name).set(
+                    float(state.consecutive_failures)
                 )
-            logger.exception(
-                "onchain_feature_live_source_failed",
-                extra={
-                    "service": "onchain_feature_live",
-                    "outcome": source_name,
-                },
-            )
+                metrics.live_source_next_eligible.labels(source=source_name).set(
+                    state.next_eligible_at.timestamp()
+                )
+                continue
+            try:
+                if isinstance(source, (SolanaWalletTradeSource, EvmTransferTradeSource, EvmPoolSwapTradeSource)):
+                    checkpoint = repository.checkpoints.load(source.config.checkpoint_key)
+                    last_cursor = checkpoint.cursor if checkpoint is not None else None
+                    records = source.fetch_trades(last_cursor=last_cursor)
+                    metrics.live_source_records.labels(
+                        source=source_name,
+                        record_type="onchain_trade",
+                    ).inc(len(records))
+                    for record in records:
+                        service.ingest_trade(record.payload, source_name=source_name)
+                        repository.checkpoints.save(
+                            CollectorCheckpoint(
+                                checkpoint_key=source.config.checkpoint_key,
+                                cursor=record.cursor,
+                                observed_at=record.observed_at,
+                                metadata={
+                                    "source_name": source_name,
+                                    "provider": source.config.provider,
+                                },
+                            )
+                        )
+                elif isinstance(source, (JupiterQuoteSource, EvmQuoteSource)):
+                    payloads = source.fetch_quotes()
+                    metrics.live_source_records.labels(
+                        source=source_name,
+                        record_type="dex_quote",
+                    ).inc(len(payloads))
+                    for payload in payloads:
+                        service.ingest_quote(payload, source_name=source_name)
+                metrics.live_source_polls.labels(source=source_name, outcome="success").inc()
+                metrics.live_source_last_success.labels(source=source_name).set(datetime.now(UTC).timestamp())
+                metrics.live_source_consecutive_failures.labels(source=source_name).set(0.0)
+                metrics.live_source_next_eligible.labels(source=source_name).set(0.0)
+                _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
+            except Exception:
+                next_failures = state.consecutive_failures + 1
+                next_eligible_at = datetime.now(UTC) + _source_retry_delay(
+                    settings.model_copy(update={"acquisition": acquisition_config}),
+                    consecutive_failures=next_failures,
+                )
+                _save_live_source_state(
+                    repository,
+                    source_name,
+                    consecutive_failures=next_failures,
+                    next_eligible_at=next_eligible_at,
+                )
+                metrics.live_source_polls.labels(source=source_name, outcome="error").inc()
+                metrics.live_source_last_error.labels(source=source_name).set(datetime.now(UTC).timestamp())
+                metrics.live_source_consecutive_failures.labels(source=source_name).set(
+                    float(next_failures)
+                )
+                metrics.live_source_next_eligible.labels(source=source_name).set(
+                    next_eligible_at.timestamp()
+                )
+                if next_failures == settings.observability.max_consecutive_live_source_failures:
+                    alert_manager.emit(
+                        "live_source_failure_threshold_exceeded",
+                        token=token,
+                        chain=chain,
+                        details={"outcome": source_name},
+                    )
+                logger.exception(
+                    "onchain_feature_live_source_failed",
+                    extra={
+                        "service": "onchain_feature_live",
+                        "outcome": source_name,
+                    },
+                )
 
     return 0
 
@@ -291,11 +330,9 @@ def run_launch_alpha_backfill(
     input_path: str | Path,
 ) -> int:
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = LaunchAlphaSyncService(settings, redis_client, repository)
-    service.ingest_jsonl(input_path)
+    with _storage_repository(settings) as (_, repository):
+        service = LaunchAlphaSyncService(settings, redis_client, repository)
+        service.ingest_jsonl(input_path)
     return 0
 
 
@@ -305,175 +342,334 @@ def run_catalyst_alpha_backfill(
     input_path: str | Path,
 ) -> int:
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = CatalystAlphaSyncService(settings, redis_client, repository)
-    service.ingest_jsonl(input_path)
+    with _storage_repository(settings) as (_, repository):
+        service = CatalystAlphaSyncService(settings, redis_client, repository)
+        service.ingest_jsonl(input_path)
     return 0
 
 
-def run_flow_alpha_backfill(
+def run_flow_measurement_backfill(
     settings: AppSettings,
     *,
     input_path: str | Path,
 ) -> int:
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = FlowAlphaSyncService(settings, redis_client, repository)
-    service.ingest_jsonl(input_path)
+    with _storage_repository(settings) as (_, repository):
+        service = FlowMeasurementSyncService(settings, redis_client, repository)
+        service.ingest_jsonl(input_path)
     return 0
 
 
 def run_catalyst_alpha_live_sync(settings: AppSettings) -> int:
     logger = get_logger("signalengine.catalyst_alpha_live")
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = CatalystAlphaSyncService(settings, redis_client, repository)
-    acquisition_config = AcquisitionConfig.model_validate(settings.acquisition)
-    now = datetime.now(UTC)
-    for source in build_catalyst_live_sources(settings):
-        source_name = source.config.source_name or "catalyst_alpha_live"
-        state = _load_live_source_state(repository, source_name)
-        if state.next_eligible_at is not None and now < state.next_eligible_at:
-            continue
-        checkpoint_key = f"acquisition:catalyst_alpha_seen:{source.config.source_name}"
-        seen_ids = _load_seen_source_event_ids(repository, checkpoint_key)
-        try:
-            snapshots = source.fetch_snapshots()
-        except InvalidCatalystFeedError as error:
-            next_failures = state.consecutive_failures + 1
-            next_eligible_at = datetime.now(UTC) + _source_retry_delay(
-                settings.model_copy(update={"acquisition": acquisition_config}),
-                consecutive_failures=next_failures,
-            )
-            _save_live_source_state(
-                repository,
-                source_name,
-                consecutive_failures=next_failures,
-                next_eligible_at=next_eligible_at,
-            )
-            logger.warning(
-                "catalyst_alpha_live_source_invalid_feed",
-                extra={
-                    "service": "catalyst_alpha_live",
-                    "outcome": str(error),
-                },
-            )
-            continue
-        except Exception:
-            next_failures = state.consecutive_failures + 1
-            next_eligible_at = datetime.now(UTC) + _source_retry_delay(
-                settings.model_copy(update={"acquisition": acquisition_config}),
-                consecutive_failures=next_failures,
-            )
-            _save_live_source_state(
-                repository,
-                source_name,
-                consecutive_failures=next_failures,
-                next_eligible_at=next_eligible_at,
-            )
-            logger.exception(
-                "catalyst_alpha_live_source_failed",
-                extra={
-                    "service": "catalyst_alpha_live",
-                    "outcome": source_name,
-                },
-            )
-            continue
-        for snapshot in snapshots:
-            if snapshot.source_event_id in seen_ids:
+    with _storage_repository(settings) as (_, repository):
+        service = CatalystAlphaSyncService(settings, redis_client, repository)
+        acquisition_config = AcquisitionConfig.model_validate(settings.acquisition)
+        now = datetime.now(UTC)
+        for source in build_catalyst_live_sources(settings):
+            source_name = source.config.source_name or "catalyst_alpha_live"
+            state = _load_live_source_state(repository, source_name)
+            if state.next_eligible_at is not None and now < state.next_eligible_at:
                 continue
-            service.ingest_snapshot(
-                snapshot.model_dump(mode="json"),
-                source_name=source.config.source_name or "catalyst_alpha_live",
-            )
-            seen_ids.append(snapshot.source_event_id)
-        _save_seen_source_event_ids(repository, checkpoint_key, seen_ids)
-        _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
+            checkpoint_key = f"acquisition:catalyst_alpha_seen:{source.config.source_name}"
+            seen_ids = _load_seen_source_event_ids(repository, checkpoint_key)
+            try:
+                snapshots = source.fetch_snapshots()
+            except InvalidCatalystFeedError as error:
+                next_failures = state.consecutive_failures + 1
+                next_eligible_at = datetime.now(UTC) + _source_retry_delay(
+                    settings.model_copy(update={"acquisition": acquisition_config}),
+                    consecutive_failures=next_failures,
+                )
+                _save_live_source_state(
+                    repository,
+                    source_name,
+                    consecutive_failures=next_failures,
+                    next_eligible_at=next_eligible_at,
+                )
+                logger.warning(
+                    "catalyst_alpha_live_source_invalid_feed",
+                    extra={
+                        "service": "catalyst_alpha_live",
+                        "outcome": str(error),
+                    },
+                )
+                continue
+            except Exception:
+                next_failures = state.consecutive_failures + 1
+                next_eligible_at = datetime.now(UTC) + _source_retry_delay(
+                    settings.model_copy(update={"acquisition": acquisition_config}),
+                    consecutive_failures=next_failures,
+                )
+                _save_live_source_state(
+                    repository,
+                    source_name,
+                    consecutive_failures=next_failures,
+                    next_eligible_at=next_eligible_at,
+                )
+                logger.exception(
+                    "catalyst_alpha_live_source_failed",
+                    extra={
+                        "service": "catalyst_alpha_live",
+                        "outcome": source_name,
+                    },
+                )
+                continue
+            for snapshot in snapshots:
+                if snapshot.source_event_id in seen_ids:
+                    continue
+                service.ingest_snapshot(
+                    snapshot.model_dump(mode="json"),
+                    source_name=source.config.source_name or "catalyst_alpha_live",
+                )
+                seen_ids.append(snapshot.source_event_id)
+            _save_seen_source_event_ids(repository, checkpoint_key, seen_ids)
+            _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
     return 0
 
 
-def run_flow_alpha_live_sync(settings: AppSettings) -> int:
-    logger = get_logger("signalengine.flow_alpha_live")
+def run_flow_measurement_live_sync(settings: AppSettings) -> int:
+    logger = get_logger("signalengine.flow_measurement_live")
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = FlowAlphaSyncService(settings, redis_client, repository)
-    acquisition_config = AcquisitionConfig.model_validate(settings.acquisition)
-    now = datetime.now(UTC)
-    for source in build_flow_live_sources(settings, repository):
-        source_name = source.config.source_name or "flow_alpha_live"
-        state = _load_live_source_state(repository, source_name)
-        if state.next_eligible_at is not None and now < state.next_eligible_at:
-            continue
-        checkpoint_key = f"acquisition:flow_alpha_seen:{source_name}"
-        seen_ids = _load_seen_source_event_ids(repository, checkpoint_key)
-        try:
-            snapshots = source.fetch_snapshots()
-        except Exception:
-            next_failures = state.consecutive_failures + 1
-            next_eligible_at = datetime.now(UTC) + _source_retry_delay(
-                settings.model_copy(update={"acquisition": acquisition_config}),
-                consecutive_failures=next_failures,
-            )
-            _save_live_source_state(
-                repository,
-                source_name,
-                consecutive_failures=next_failures,
-                next_eligible_at=next_eligible_at,
-            )
-            logger.exception(
-                "flow_alpha_live_source_failed",
-                extra={
-                    "service": "flow_alpha_live",
-                    "outcome": source_name,
-                },
-            )
-            continue
-        for snapshot in snapshots:
-            if snapshot.source_event_id in seen_ids:
+    with _storage_repository(settings) as (_, repository):
+        service = FlowMeasurementSyncService(settings, redis_client, repository)
+        acquisition_config = AcquisitionConfig.model_validate(settings.acquisition)
+        now = datetime.now(UTC)
+        for source in build_flow_live_sources(settings, repository):
+            source_name = source.config.source_name or "flow_measurement_live"
+            state = _load_live_source_state(repository, source_name)
+            if state.next_eligible_at is not None and now < state.next_eligible_at:
                 continue
-            service.ingest_snapshot(
-                snapshot.model_dump(mode="json"),
-                source_name=source_name,
-                publish_event=not getattr(source.config, "observe_only", False),
-            )
-            seen_ids.append(snapshot.source_event_id)
-        _save_seen_source_event_ids(repository, checkpoint_key, seen_ids)
-        _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
+            checkpoint_key = f"acquisition:flow_measurement_seen:{source_name}"
+            seen_ids = _load_seen_source_event_ids(repository, checkpoint_key)
+            try:
+                snapshots = source.fetch_snapshots()
+            except Exception:
+                next_failures = state.consecutive_failures + 1
+                next_eligible_at = datetime.now(UTC) + _source_retry_delay(
+                    settings.model_copy(update={"acquisition": acquisition_config}),
+                    consecutive_failures=next_failures,
+                )
+                _save_live_source_state(
+                    repository,
+                    source_name,
+                    consecutive_failures=next_failures,
+                    next_eligible_at=next_eligible_at,
+                )
+                logger.exception(
+                    "flow_measurement_live_source_failed",
+                    extra={
+                        "service": "flow_measurement_live",
+                        "outcome": source_name,
+                    },
+                )
+                continue
+            for snapshot in snapshots:
+                if snapshot.source_event_id in seen_ids:
+                    continue
+                service.ingest_snapshot(
+                    snapshot.model_dump(mode="json"),
+                    source_name=source_name,
+                    publish_event=not getattr(source.config, "observe_only", False),
+                )
+                seen_ids.append(snapshot.source_event_id)
+            _save_seen_source_event_ids(repository, checkpoint_key, seen_ids)
+            _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
     return 0
 
 
 def run_launch_alpha_live_sync(settings: AppSettings) -> int:
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = LaunchAlphaSyncService(settings, redis_client, repository)
-    for source in build_launch_live_sources(settings, repository):
-        for snapshot in source.fetch_snapshots():
-            service.ingest_snapshot(
-                snapshot.model_dump(mode="json"),
-                source_name=source.config.source_name or "launch_alpha_live",
-            )
+    with _storage_repository(settings) as (_, repository):
+        service = LaunchAlphaSyncService(settings, redis_client, repository)
+        for source in build_launch_live_sources(settings, repository):
+            for snapshot in source.fetch_snapshots():
+                service.ingest_snapshot(
+                    snapshot.model_dump(mode="json"),
+                    source_name=source.config.source_name or "launch_alpha_live",
+                )
     return 0
 
 
 def run_telegram_publisher_live(settings: AppSettings) -> int:
     redis_client = get_redis_client(settings)
-    engine = get_engine(settings)
-    init_storage(engine)
-    repository = StorageRepository(engine)
-    service = TelegramPublisherService(settings, redis_client, repository)
-    service.ensure_stream()
-    service.process_once(count=100, block_ms=1000)
+    with _storage_repository(settings) as (_, repository):
+        metrics = Metrics(settings.observability.service_namespace)
+        service = TelegramPublisherService(settings, redis_client, repository, metrics=metrics)
+        service.ensure_stream()
+        service.process_once(count=100, block_ms=1000)
     return 0
+
+
+def run_social_live_sync(settings: AppSettings) -> int:
+    redis_client = get_redis_client(settings)
+    with _storage_repository(settings) as (_, repository):
+        for source in build_social_live_sources(settings):
+            for event in source.fetch_events():
+                existing = repository.raw_events.load(source.config.source_name or event.source, event.event_id)
+                if existing is not None:
+                    continue
+                repository.raw_events.save(
+                    RawEventRecord(
+                        source_type="social_signal_snapshot",
+                        source_name=source.config.source_name or event.source,
+                        source_event_id=event.event_id,
+                        chain=event.chain,
+                        token=event.token,
+                        observed_at=event.observed_at,
+                        ingested_at=event.ingested_at,
+                        payload=event.model_dump(mode="json"),
+                    )
+                )
+                publish_raw_events(redis_client, settings, event)
+    return 0
+
+
+def run_social_confirmation_requests(
+    settings: AppSettings,
+    requests: list[SocialQueryRequest],
+) -> int:
+    logger = get_logger("signalengine.social_confirmation_requests")
+    redis_client = get_redis_client(settings)
+    with _storage_repository(settings) as (_, repository):
+        sync_service = SocialConfirmationSyncService(settings, redis_client, repository)
+        analyzer = build_social_llm_analyzer(settings)
+        for social_query in requests:
+            try:
+                source = build_social_confirmation_source(settings, social_query)
+                source_name = source.config.source_name or social_query.source_name or source.config.platform
+                requested_event = build_social_query_requested_event(
+                    social_query,
+                    source_name=source_name,
+                )
+                _persist_social_event(repository, requested_event, source_type="social_query_request")
+
+                events = source.fetch_events()
+                social_event = events[0] if events else None
+                if social_event is not None:
+                    _persist_social_event(repository, social_event, source_type="social_signal_snapshot")
+                    publish_raw_events(redis_client, settings, social_event)
+
+                llm_analysis = analyzer.analyze(social_query, social_event)
+
+                analysis_event = build_social_analysis_event(
+                    social_query,
+                    source_name=source_name,
+                    social_event=social_event,
+                    llm_analysis=llm_analysis,
+                )
+                _persist_social_event(repository, analysis_event, source_type="social_analysis_completed")
+                publish_raw_events(redis_client, settings, analysis_event)
+                sync_service.ingest_analysis_event(
+                    analysis_event,
+                    source_name=source_name,
+                )
+            except Exception:
+                logger.exception(
+                    "social_confirmation_request_failed",
+                    extra={
+                        "service": "social_confirmation_requests",
+                        "outcome": social_query.request_id,
+                        "token": social_query.token,
+                        "chain": social_query.chain,
+                    },
+                )
+    return 0
+
+
+def run_social_confirmation_live(
+    settings: AppSettings,
+    *,
+    group_name: str,
+    consumer_name: str,
+    count: int = 100,
+    block_ms: int | None = 1000,
+) -> int:
+    logger = get_logger("signalengine.social_confirmation_live")
+    redis_client = get_redis_client(settings)
+    with _storage_repository(settings) as (_, repository):
+        ensure_consumer_group(redis_client, settings.redis.raw_events_stream, group_name)
+        messages = read_group_models(
+            redis_client,
+            settings.redis.raw_events_stream,
+            group_name,
+            consumer_name,
+            EventEnvelope,
+            count=count,
+            block_ms=block_ms,
+        )
+        requests: list[SocialQueryRequest] = []
+        for message_id, event in messages:
+            try:
+                if event.event_type != "social.query_requested":
+                    continue
+                requests.append(_social_query_request_from_event(event))
+            except Exception as error:  # noqa: BLE001
+                publish_dead_letter(
+                    redis_client,
+                    settings,
+                    source_stream=settings.redis.raw_events_stream,
+                    message_id=message_id,
+                    kind=event.event_type,
+                    payload=event.model_dump(mode="json"),
+                    reason=str(error),
+                )
+            finally:
+                acknowledge_message(redis_client, settings.redis.raw_events_stream, group_name, message_id)
+
+        if not requests:
+            logger.info(
+                "social_confirmation_live_idle",
+                extra={
+                    "service": "social_confirmation_live",
+                    "outcome": f"no_requests:{consumer_name}",
+                },
+            )
+            return 0
+
+        _ = repository
+    return run_social_confirmation_requests(settings, requests)
+
+
+def _persist_social_event(
+    repository: StorageRepository,
+    event: EventEnvelope,
+    *,
+    source_type: str,
+) -> None:
+    existing = repository.raw_events.load(event.source, event.event_id)
+    if existing is not None:
+        return
+    repository.raw_events.save(
+        RawEventRecord(
+            source_type=source_type,
+            source_name=event.source,
+            source_event_id=event.event_id,
+            chain=event.chain,
+            token=event.token,
+            observed_at=event.observed_at,
+            ingested_at=event.ingested_at,
+            payload=event.model_dump(mode="json"),
+        )
+    )
+
+
+def _social_query_request_from_event(event: EventEnvelope) -> SocialQueryRequest:
+    payload = event.payload
+    return SocialQueryRequest(
+        request_id=str(payload.get("request_id", event.event_id)),
+        source_name=event.source,
+        platform=(str(payload["platform"]) if payload.get("platform") is not None else None),
+        chain=event.chain,
+        token=event.token,
+        query=(str(payload["query"]) if payload.get("query") is not None else None),
+        mode=str(payload.get("mode", "confirmation")),
+        requested_at=event.observed_at,
+        candidate_id=(str(payload["candidate_id"]) if payload.get("candidate_id") is not None else None),
+        fsm_context=payload.get("fsm_context"),
+        metadata=dict(payload.get("metadata", {})) if isinstance(payload.get("metadata"), dict) else {},
+    )
 
 
 class _LiveSourceState:
@@ -584,7 +780,6 @@ def main() -> int:
                 settings,
                 chain=args.wallet_chain,
                 chain_index=args.wallet_chain_index,
-                token=args.wallet_token,
                 time_frame=args.wallet_time_frame,
                 sort_by=args.wallet_sort_by,
                 wallet_type=args.wallet_type,
@@ -610,18 +805,26 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _handle_sync_stop_signal)
 
         while not stop_event.is_set():
-            run_wallet_intelligence_sync(
-                settings,
-                chain=args.wallet_chain,
-                chain_index=args.wallet_chain_index,
-                token=args.wallet_token,
-                time_frame=args.wallet_time_frame,
-                sort_by=args.wallet_sort_by,
-                wallet_type=args.wallet_type,
-                refresh_limit=args.wallet_refresh_limit,
-                raw_event_count=args.wallet_raw_event_count,
-                raw_event_last_id=args.wallet_raw_last_id,
-            )
+            try:
+                run_wallet_intelligence_sync(
+                    settings,
+                    chain=args.wallet_chain,
+                    chain_index=args.wallet_chain_index,
+                    time_frame=args.wallet_time_frame,
+                    sort_by=args.wallet_sort_by,
+                    wallet_type=args.wallet_type,
+                    refresh_limit=args.wallet_refresh_limit,
+                    raw_event_count=args.wallet_raw_event_count,
+                    raw_event_last_id=args.wallet_raw_last_id,
+                )
+            except Exception:
+                logger.exception(
+                    "wallet_intelligence_sync_failed",
+                    extra={
+                        "service": "wallet_intelligence_sync",
+                        "outcome": "loop_iteration_failed",
+                    },
+                )
             sleep(sync_config.sync_interval_seconds)
         return 0
 
@@ -632,7 +835,6 @@ def main() -> int:
                 settings,
                 chain=args.wallet_chain,
                 chain_index=args.wallet_chain_index,
-                token=args.wallet_token,
                 time_frame=args.wallet_time_frame,
                 sort_by=args.wallet_sort_by,
                 wallet_type=args.wallet_type,
@@ -657,17 +859,25 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _handle_project_stop_signal)
 
         while not stop_event.is_set():
-            run_wallet_flow_projection(
-                settings,
-                chain=args.wallet_chain,
-                chain_index=args.wallet_chain_index,
-                token=args.wallet_token,
-                time_frame=args.wallet_time_frame,
-                sort_by=args.wallet_sort_by,
-                wallet_type=args.wallet_type,
-                raw_event_count=args.wallet_raw_event_count,
-                raw_event_last_id=args.wallet_raw_last_id,
-            )
+            try:
+                run_wallet_flow_projection(
+                    settings,
+                    chain=args.wallet_chain,
+                    chain_index=args.wallet_chain_index,
+                    time_frame=args.wallet_time_frame,
+                    sort_by=args.wallet_sort_by,
+                    wallet_type=args.wallet_type,
+                    raw_event_count=args.wallet_raw_event_count,
+                    raw_event_last_id=args.wallet_raw_last_id,
+                )
+            except Exception:
+                logger.exception(
+                    "wallet_flow_projection_failed",
+                    extra={
+                        "service": "wallet_flow_projection",
+                        "outcome": "loop_iteration_failed",
+                    },
+                )
             sleep(sync_config.sync_interval_seconds)
         return 0
 
@@ -698,8 +908,10 @@ def main() -> int:
 
     if args.onchain_feature_live:
         acquisition_config = settings.acquisition
+        registry = MeasurementProfileRegistry(redis_client=get_redis_client(settings))
+
         if args.once:
-            return run_onchain_feature_live_sync(settings)
+            return run_onchain_feature_live_sync(settings, registry=registry)
 
         stop_event = Event()
 
@@ -718,7 +930,7 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _handle_onchain_live_stop_signal)
 
         while not stop_event.is_set():
-            run_onchain_feature_live_sync(settings)
+            run_onchain_feature_live_sync(settings, registry=registry)
             sleep(acquisition_config.sync_interval_seconds)
         return 0
 
@@ -772,28 +984,28 @@ def main() -> int:
             sleep(args.sleep_seconds)
         return 0
 
-    if args.flow_alpha_backfill:
+    if args.flow_measurement_backfill:
         if args.once:
-            return run_flow_alpha_backfill(settings, input_path=args.flow_alpha_backfill)
+            return run_flow_measurement_backfill(settings, input_path=args.flow_measurement_backfill)
 
         stop_event = Event()
 
-        def _handle_flow_alpha_stop_signal(signum: int, frame: object) -> None:
+        def _handle_flow_measurement_stop_signal(signum: int, frame: object) -> None:
             _ = frame
             logger.info(
-                "flow_alpha_backfill_stop_requested",
+                "flow_measurement_backfill_stop_requested",
                 extra={
-                    "service": "flow_alpha_backfill",
+                    "service": "flow_measurement_backfill",
                     "outcome": f"signal_{signum}",
                 },
             )
             stop_event.set()
 
-        signal.signal(signal.SIGINT, _handle_flow_alpha_stop_signal)
-        signal.signal(signal.SIGTERM, _handle_flow_alpha_stop_signal)
+        signal.signal(signal.SIGINT, _handle_flow_measurement_stop_signal)
+        signal.signal(signal.SIGTERM, _handle_flow_measurement_stop_signal)
 
         while not stop_event.is_set():
-            run_flow_alpha_backfill(settings, input_path=args.flow_alpha_backfill)
+            run_flow_measurement_backfill(settings, input_path=args.flow_measurement_backfill)
             sleep(args.sleep_seconds)
         return 0
 
@@ -823,29 +1035,29 @@ def main() -> int:
             sleep(acquisition_config.sync_interval_seconds)
         return 0
 
-    if args.flow_alpha_live:
+    if args.flow_measurement_live:
         acquisition_config = settings.acquisition
         if args.once:
-            return run_flow_alpha_live_sync(settings)
+            return run_flow_measurement_live_sync(settings)
 
         stop_event = Event()
 
-        def _handle_flow_alpha_live_stop_signal(signum: int, frame: object) -> None:
+        def _handle_flow_measurement_live_stop_signal(signum: int, frame: object) -> None:
             _ = frame
             logger.info(
-                "flow_alpha_live_stop_requested",
+                "flow_measurement_live_stop_requested",
                 extra={
-                    "service": "flow_alpha_live",
+                    "service": "flow_measurement_live",
                     "outcome": f"signal_{signum}",
                 },
             )
             stop_event.set()
 
-        signal.signal(signal.SIGINT, _handle_flow_alpha_live_stop_signal)
-        signal.signal(signal.SIGTERM, _handle_flow_alpha_live_stop_signal)
+        signal.signal(signal.SIGINT, _handle_flow_measurement_live_stop_signal)
+        signal.signal(signal.SIGTERM, _handle_flow_measurement_live_stop_signal)
 
         while not stop_event.is_set():
-            run_flow_alpha_live_sync(settings)
+            run_flow_measurement_live_sync(settings)
             sleep(acquisition_config.sync_interval_seconds)
         return 0
 
@@ -898,6 +1110,67 @@ def main() -> int:
         while not stop_event.is_set():
             run_telegram_publisher_live(settings)
             sleep(args.sleep_seconds)
+        return 0
+
+    if args.social_confirmation_live:
+        if args.once:
+            return run_social_confirmation_live(
+                settings,
+                group_name=args.group,
+                consumer_name=args.consumer,
+                count=args.count,
+            )
+
+        stop_event = Event()
+
+        def _handle_social_confirmation_stop_signal(signum: int, frame: object) -> None:
+            _ = frame
+            logger.info(
+                "social_confirmation_live_stop_requested",
+                extra={
+                    "service": "social_confirmation_live",
+                    "outcome": f"signal_{signum}",
+                },
+            )
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, _handle_social_confirmation_stop_signal)
+        signal.signal(signal.SIGTERM, _handle_social_confirmation_stop_signal)
+
+        while not stop_event.is_set():
+            run_social_confirmation_live(
+                settings,
+                group_name=args.group,
+                consumer_name=args.consumer,
+                count=args.count,
+            )
+            sleep(args.sleep_seconds)
+        return 0
+
+    if args.social_live:
+        acquisition_config = settings.acquisition
+        if args.once:
+            return run_social_live_sync(settings)
+
+        stop_event = Event()
+
+        def _handle_social_live_stop_signal(signum: int, frame: object) -> None:
+            _ = frame
+            logger.info(
+                "social_live_stop_requested",
+                extra={
+                    "service": "social_live",
+                    "outcome": f"signal_{signum}",
+                },
+            )
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, _handle_social_live_stop_signal)
+        signal.signal(signal.SIGTERM, _handle_social_live_stop_signal)
+
+        while not stop_event.is_set():
+            run_social_live_sync(settings)
+            sleep(acquisition_config.sync_interval_seconds)
         return 0
 
     start_metrics_server(

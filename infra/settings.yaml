@@ -76,13 +76,26 @@ notifications:
     consumer_group: telegram-publisher
     consumer_name: telegram-publisher-1
 
-# 生产采集链路配置：链上 trade / quote、launch / catalyst / flow alpha 都从这里开关与参数化。
+# LLM enrichment for social analysis: disabled by default, heuristic fallback remains available.
+llm:
+  enabled: false
+  provider: heuristic
+  model: gpt-5.4
+  api_key:
+  base_url:
+  timeout_seconds: 8.0
+  temperature: 0.0
+  max_evidence_texts: 6
+  max_summary_chars: 280
+
+# 生产采集链路配置：链上 trade / quote、launch / catalyst / flow measurement 都从这里开关与参数化。
 acquisition:
   sync_interval_seconds: 5.0
   failure_backoff_seconds: 5.0
   source_cooldown_seconds: 60.0
 
-  # 直接盯某个 Solana 地址或 owner 的交易流，适合钱包级观察，不参与当前默认执行主线。
+  # 直接盯某个 Solana 地址或 owner 的交易流，适合钱包级 measurement 观察，不参与当前默认 discovery 主线。
+  # `token` 在这里是 measurement 标签，不是 discovery watchlist；默认样例保持空值。
   solana_wallet_trade:
     enabled: false
     provider: solana_rpc_wallet_watch
@@ -93,7 +106,7 @@ acquisition:
     signature_address:
     owner_address:
     wallet_address:
-    token: BONK
+    token: ""
     token_mint:
     quote_asset: USDC
     quote_mint:
@@ -101,13 +114,14 @@ acquisition:
     pool_address: wallet-watch
     poll_limit: 20
 
-  # 单一路由 Jupiter quote fallback；当前更推荐使用 jupiter_quote_routes 按 token 分路由。
+  # 单一路由 Jupiter quote fallback；当前更推荐使用显式 measurement profile 或 jupiter_quote_routes。
+  # `token` 仅用于给 quote measurement 打标签，默认样例保持空值。
   jupiter_quote:
     enabled: false
     provider: jupiter_quote_api
     source_name: jupiter_quote_api
     chain: solana
-    token: BONK
+    token: ""
     input_mint:
     output_mint:
     input_decimals: 6
@@ -118,10 +132,11 @@ acquisition:
     swap_url: https://lite-api.jup.ag/swap/v1/swap
     price_url: https://lite-api.jup.ag/price/v2
 
-  # Solana token -> Jupiter 路由表，live execution 与 quote 采样都优先走这里。
+  # Solana measurement route -> Jupiter 路由表，live execution 与 quote 采样都优先走这里。
   jupiter_quote_routes: {}
 
   # 旧版单入口 EVM transfer watch，现仅保留为兼容入口；加载后会自动投影进统一 evm_routes registry。
+  # `token` 只是 transfer measurement 标签，默认样例保持空值。
   evm_transfer_trade:
     enabled: false
     provider: evm_rpc_transfer_watch
@@ -129,7 +144,7 @@ acquisition:
     checkpoint_key: acquisition:evm_transfer_trades
     chain: base
     wallet_address:
-    token: AERO
+    token: ""
     token_contract:
     quote_asset: USDC
     quote_contract:
@@ -160,7 +175,7 @@ acquisition:
       quote_api_url: https://api.0x.org/swap/permit2/price
       price_url: https://api.dexscreener.com/latest/dex/tokens
 
-  # 多链 EVM route registry：只保留 token / pair / source_type 等 route 级字段。
+  # 多链 EVM route registry：只保留 measurement route 级字段；`token` 用于结果归属，不是 discovery 配置。
   evm_routes:
     base_quote:
       enabled: false
@@ -168,7 +183,7 @@ acquisition:
       source_name: evm_base_quote
       checkpoint_key: acquisition:evm_routes:base_quote
       chain: base
-      token: AERO
+      token: ""
       token_contract:
       quote_asset: USDC
       quote_contract:
@@ -182,7 +197,7 @@ acquisition:
       source_name: evm_ethereum_pool
       checkpoint_key: acquisition:evm_routes:ethereum_pool
       chain: ethereum
-      token: UNI
+      token: ""
       token_contract:
       quote_asset: USDC
       quote_contract:
@@ -200,7 +215,7 @@ acquisition:
       checkpoint_key: acquisition:evm_routes:arbitrum_transfer
       chain: arbitrum
       wallet_address:
-      token: ARB
+      token: ""
       token_contract:
       quote_asset: USDC
       quote_contract:
@@ -277,26 +292,16 @@ acquisition:
       max_snapshot_age_minutes: 720
       required_keywords: [list, listing, roadmap, launch]
       excluded_keywords: [delist, removal, maintenance, suspend]
-      token_configs:
-        - token: AERO
-          chain: base
-          aliases: [aerodrome]
-          catalyst_type: cex_listing_announcement
-          venue: binance
-          impact_score: 0.88
-          credibility_score: 0.92
-        - token: ARB
-          chain: arbitrum
-          aliases: [arbitrum]
-          catalyst_type: cex_listing_announcement
-          venue: binance
-          impact_score: 0.82
-          credibility_score: 0.92
+      venue: binance
+      default_chain: unknown
+      impact_score: 0.88
+      credibility_score: 0.92
+      extraction_mode: llm_with_heuristic_fallback
     coinbase_blog:
       enabled: true
       provider: coinbase_html_page
       source_name: catalyst_alpha_coinbase
-      source_url: https://blog.coinbase.com/feed
+      source_url: https://www.coinbase.com/blog
       timeout_seconds: 5.0
       retry_attempts: 3
       retry_backoff_seconds: 0.75
@@ -304,19 +309,17 @@ acquisition:
       max_snapshot_age_minutes: 720
       required_keywords: [list, listing, roadmap, asset]
       excluded_keywords: [delist, removal, maintenance, suspend]
-      token_configs:
-        - token: ARB
-          chain: arbitrum
-          aliases: [arbitrum]
-          catalyst_type: cex_listing_announcement
-          venue: coinbase
-          impact_score: 0.8
-          credibility_score: 0.88
+      venue: coinbase
+      default_chain: unknown
+      impact_score: 0.8
+      credibility_score: 0.88
+      extraction_mode: llm_with_heuristic_fallback
 
-          # Flow Alpha：聪明钱包与资金流聚合结果。
+          # Flow Alpha：token-bound 钱包流默认只做 confirmation / measurement，不作为 discovery 入口。
   flow_alpha_sources:
     base_aero_wallet_flow:
       enabled: false
+      observe_only: true
       provider: wallet_intelligence_store
       source_name: flow_alpha_base_aero
       chain: base
@@ -328,6 +331,35 @@ acquisition:
       min_smart_money_inflow_usd: 40000.0
       min_unique_buyer_wallets_15m: 4
       min_exchange_outflow_usd: 0.0
+
+  # Social Alpha：X / Reddit 这类叙事信号先统一归一化成 social.signal_snapshot。
+  social_sources:
+    x:
+      enabled: false
+      provider: x_snapshot_json
+      source_name: social_x
+      platform: x
+      query_template: "${cashtag} OR ${token}"
+      source_url: https://social-bridge.example/x/search.json?q=%24BONK
+      max_snapshot_age_seconds: 300.0
+      min_sentiment_score: 0.25
+      min_velocity_score: 0.20
+      min_mentions: 5
+      min_unique_authors: 3
+    reddit:
+      enabled: false
+      provider: reddit_search_json
+      source_name: social_reddit
+      platform: reddit
+      query_template: "{token}"
+      subreddit: CryptoMoonShots
+      sort: new
+      limit: 25
+      max_snapshot_age_seconds: 600.0
+      min_sentiment_score: 0.20
+      min_velocity_score: 0.15
+      min_mentions: 3
+      min_unique_authors: 2
 
     # live 运行期控制：资金缓冲、kill switch、凭证来源、余额与定价 provider。
 live:
@@ -377,7 +409,7 @@ live:
     enabled: false
     chain: solana
     chain_index: "501"
-    token: BONK
+    measurement_token: BONK
     time_frame: "3"
     sort_by: "1"
     wallet_type: "3"

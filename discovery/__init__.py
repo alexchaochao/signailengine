@@ -13,8 +13,8 @@ from discovery.schemas import (
 from discovery.service import (
     CatalystAlphaSyncResult,
     CatalystAlphaSyncService,
-    FlowAlphaSyncResult,
-    FlowAlphaSyncService,
+    FlowMeasurementSyncResult,
+    FlowMeasurementSyncService,
     LaunchAlphaSyncResult,
     LaunchAlphaSyncService,
 )
@@ -30,8 +30,8 @@ __all__ = [
     "CatalystEventSnapshot",
     "FlowActivitySnapshot",
     "FlowAlphaScanner",
-    "FlowAlphaSyncResult",
-    "FlowAlphaSyncService",
+    "FlowMeasurementSyncResult",
+    "FlowMeasurementSyncService",
     "LaunchAlphaScanner",
     "LaunchAlphaSyncResult",
     "LaunchAlphaSyncService",

@@ -11,6 +11,7 @@ from core.config import AppSettings, ChainWalletCredentialsConfig
 from core.pipeline import PipelineWorker
 from core.schemas import (
     ActionType,
+    EventEnvelope,
     ExecutionIntent,
     ExecutionLedgerEntry,
     ExecutionReport,
@@ -473,6 +474,117 @@ def test_pipeline_worker_persists_fsm_state_across_runs() -> None:
     assert checkpoint is not None
     assert checkpoint.cursor == TokenState.NARRATIVE_EXPLOSION.value
     assert checkpoint.metadata["last_transition_timestamp"] == first.transition.timestamp
+
+
+def test_pipeline_worker_attaches_fsm_context_to_decision_and_audit_outputs() -> None:
+    settings = AppSettings.load()
+    client = FakeRedis()
+    engine = create_engine("sqlite:///:memory:")
+    worker = PipelineWorker(settings, cast(Redis, client), db_engine=engine)
+    worker.ensure_streams("signal-workers")
+    observed_at = datetime.now(UTC)
+
+    result = worker.process_events(
+        [
+            build_onchain_event(
+                {
+                    "token": "BONK",
+                    "observed_at": observed_at,
+                    "liquidity_usd": 180_000,
+                    "volume_5m_usd": 60_000,
+                    "buy_pressure": 0.82,
+                    "estimated_slippage_bps": 90,
+                }
+            ),
+            build_wallet_event(
+                {
+                    "token": "BONK",
+                    "observed_at": observed_at,
+                    "wallet_inflow_score": 0.70,
+                }
+            ),
+        ]
+    )
+
+    assert result.route.fsm_context is not None
+    assert result.route.fsm_context.current_state == TokenState.NARRATIVE_EXPLOSION
+    assert result.route.fsm_context.previous_state == TokenState.UNKNOWN
+    assert result.risk.fsm_context is not None
+    assert result.risk.fsm_context.last_transition_timestamp == result.transition.timestamp
+    assert result.execution is not None
+    assert result.execution.fsm_context is not None
+    assert result.execution.fsm_context.current_state == result.transition.new_state
+    assert result.reconciliation is not None
+    assert result.reconciliation.fsm_context is not None
+    assert all(entry.fsm_context is not None for entry in result.execution_ledger)
+    assert all(
+        entry.fsm_context is not None
+        and entry.fsm_context.current_state == result.transition.new_state
+        for entry in result.execution_ledger
+    )
+
+
+def test_pipeline_worker_emits_social_confirmation_requests_on_transition() -> None:
+    settings = AppSettings.load().model_copy(
+        update={
+            "acquisition": {
+                "social_sources": {
+                    "x": {
+                        "enabled": True,
+                        "platform": "x",
+                        "provider": "x_snapshot_json",
+                        "source_name": "social_x",
+                        "query_template": "${cashtag} OR ${token}",
+                        "source_url": "https://social-bridge.example/x/search.json",
+                    },
+                    "reddit": {
+                        "enabled": True,
+                        "platform": "reddit",
+                        "provider": "reddit_search_json",
+                        "source_name": "social_reddit",
+                        "query_template": "{token}",
+                    },
+                }
+            }
+        }
+    )
+    client = FakeRedis()
+    engine = create_engine("sqlite:///:memory:")
+    worker = PipelineWorker(settings, cast(Redis, client), db_engine=engine)
+    worker.ensure_streams("signal-workers")
+
+    worker.process_events(
+        [
+            build_onchain_event(
+                {
+                    "token": "BONK",
+                    "observed_at": datetime.now(UTC),
+                    "liquidity_usd": 180_000,
+                    "volume_5m_usd": 60_000,
+                    "buy_pressure": 0.82,
+                    "estimated_slippage_bps": 90,
+                }
+            ),
+            build_wallet_event(
+                {
+                    "token": "BONK",
+                    "observed_at": datetime.now(UTC),
+                    "wallet_inflow_score": 0.70,
+                }
+            ),
+        ]
+    )
+
+    request_events = [
+        EventEnvelope.model_validate_json(message[1]["payload"])
+        for message in client.streams[settings.redis.raw_events_stream]
+        if message[1]["kind"] == "social.query_requested"
+    ]
+
+    assert len(request_events) == 2
+    assert {event.source for event in request_events} == {"social_x", "social_reddit"}
+    assert all(event.payload["metadata"]["trigger"] == "fsm_transition" for event in request_events)
+    assert all(event.payload["query"] is None for event in request_events)
 
 
 def test_pipeline_worker_recovers_submitted_orders_on_startup() -> None:

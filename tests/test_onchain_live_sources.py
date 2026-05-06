@@ -70,6 +70,51 @@ def test_build_live_sources_returns_enabled_sources() -> None:
     assert sum(isinstance(source, EvmQuoteSource) for source in sources) == 1
 
 
+def test_build_live_sources_skips_incomplete_measurement_templates() -> None:
+    settings = AppSettings.load().model_copy(
+        update={
+            "acquisition": {
+                "solana_wallet_trade": {
+                    "enabled": True,
+                    "wallet_address": "wallet-1",
+                    "token": "",
+                    "token_mint": "",
+                    "quote_mint": "",
+                },
+                "jupiter_quote": {
+                    "enabled": True,
+                    "token": "",
+                    "input_mint": "",
+                    "output_mint": "",
+                },
+                "evm_sources": {
+                    "base_quote": {
+                        "enabled": True,
+                        "source_type": "quote",
+                        "chain": "base",
+                        "token": "",
+                        "token_contract": "",
+                        "quote_contract": "",
+                    },
+                    "base_pool": {
+                        "enabled": True,
+                        "source_type": "pool_swap_trade",
+                        "chain": "base",
+                        "token": "",
+                        "pool_address": "",
+                        "token_contract": "",
+                        "quote_contract": "",
+                    },
+                },
+            }
+        }
+    )
+
+    sources = build_live_sources(settings)
+
+    assert sources == []
+
+
 def test_jupiter_quote_source_fetches_normalized_quote() -> None:
     settings = AppSettings.load().model_copy(
         update={
@@ -898,3 +943,548 @@ def test_evm_quote_source_prefers_most_active_dexscreener_pair_over_quote_match(
     assert payloads[0]["route_summary"]["market_pair_address"] == "0xdeep-weth"
     assert payloads[0]["route_summary"]["volume_5m_usd"] == 39013.75
     assert payloads[0]["route_summary"]["buy_pressure"] == 0.404762
+
+
+# ── MeasurementProfileRegistry ─────────────────────────────────────────────
+
+
+def test_measurement_profile_registry_register_and_get() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    registry = MeasurementProfileRegistry()
+    profile = MeasurementProfile(
+        profile_id="disc:evt-1",
+        chain="solana",
+        token="BONK",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="evt-1",
+        registered_at=datetime.now(UTC),
+        token_mint="bonk-mint",
+        quote_mint="usdc-mint",
+        chain_type="solana",
+    )
+
+    registry.register(profile)
+
+    fetched = registry.get("solana", "BONK")
+    assert fetched is not None
+    assert fetched.profile_id == "disc:evt-1"
+    assert fetched.token_mint == "bonk-mint"
+
+    missing = registry.get("solana", "UNKNOWN")
+    assert missing is None
+
+
+def test_measurement_profile_registry_skips_duplicate_registration() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    registry = MeasurementProfileRegistry()
+    profile = MeasurementProfile(
+        profile_id="disc:evt-1",
+        chain="solana",
+        token="BONK",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="evt-1",
+        registered_at=datetime.now(UTC),
+        chain_type="solana",
+    )
+
+    registry.register(profile)
+    registry.register(profile)  # same profile_id — no-op
+
+    assert registry.count() == 1
+
+
+def test_measurement_profile_registry_ignores_stale_profiles() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime, timedelta
+
+    registry = MeasurementProfileRegistry()
+    stale = MeasurementProfile(
+        profile_id="disc:stale",
+        chain="solana",
+        token="STALE",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="stale-evt",
+        registered_at=datetime.now(UTC) - timedelta(hours=2),
+        ttl_seconds=3600.0,
+        chain_type="solana",
+    )
+    registry.register(stale)
+
+    assert registry.get("solana", "STALE") is None
+    assert registry.count() == 0
+
+
+def test_measurement_profile_registry_active_profiles_excludes_stale() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime, timedelta
+
+    registry = MeasurementProfileRegistry()
+    fresh = MeasurementProfile(
+        profile_id="disc:fresh",
+        chain="solana",
+        token="FRESH",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="fresh-evt",
+        registered_at=datetime.now(UTC),
+        chain_type="solana",
+    )
+    stale = MeasurementProfile(
+        profile_id="disc:stale",
+        chain="solana",
+        token="STALE",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="stale-evt",
+        registered_at=datetime.now(UTC) - timedelta(hours=2),
+        ttl_seconds=3600.0,
+        chain_type="solana",
+    )
+    registry.register(fresh)
+    registry.register(stale)
+
+    active = registry.active_profiles()
+    assert len(active) == 1
+    assert active[0].token == "FRESH"
+
+
+def test_measurement_profile_registry_cleanup_removes_stale() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime, timedelta
+
+    registry = MeasurementProfileRegistry()
+    stale = MeasurementProfile(
+        profile_id="disc:stale",
+        chain="solana",
+        token="STALE",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="stale-evt",
+        registered_at=datetime.now(UTC) - timedelta(hours=2),
+        ttl_seconds=3600.0,
+        chain_type="solana",
+    )
+    registry.register(stale)
+    registry.cleanup()
+
+    assert registry.count() == 0
+
+
+# ── resolve_token_addresses_for_discovery ──────────────────────────────────
+
+
+def test_resolve_token_addresses_for_discovery_solana() -> None:
+    from sentinel.onchain_live_sources import resolve_token_addresses_for_discovery
+
+    def http_get(url: str, headers: dict[str, str], timeout: float) -> dict[str, object]:
+        _ = headers, timeout
+        assert "dexscreener" in url
+        return {
+            "pairs": [
+                {
+                    "chainId": "solana",
+                    "dexId": "raydium",
+                    "pairAddress": "pair-xxx",
+                    "baseToken": {"symbol": "BONK", "address": "bonk-mint-abc"},
+                    "quoteToken": {"symbol": "USDC", "address": "usdc-mint-xyz"},
+                    "priceUsd": "0.000012",
+                }
+            ]
+        }
+
+    result = resolve_token_addresses_for_discovery("solana", "BONK", http_get=http_get)
+
+    assert result["chain_type"] == "solana"
+    assert result["token_mint"] == "bonk-mint-abc"
+    assert result["quote_mint"] == "usdc-mint-xyz"
+    assert result["pool_address"] == "pair-xxx"
+    assert result["dex"] == "raydium"
+
+
+def test_resolve_token_addresses_for_discovery_evm() -> None:
+    from sentinel.onchain_live_sources import resolve_token_addresses_for_discovery
+
+    def http_get(url: str, headers: dict[str, str], timeout: float) -> dict[str, object]:
+        _ = headers, timeout
+        return {
+            "pairs": [
+                {
+                    "chainId": "base",
+                    "dexId": "aerodrome",
+                    "pairAddress": "0xpair",
+                    "baseToken": {"symbol": "AERO", "address": "0xaero-contract"},
+                    "quoteToken": {"symbol": "USDC", "address": "0xusdc-contract"},
+                    "priceUsd": "2.45",
+                }
+            ]
+        }
+
+    result = resolve_token_addresses_for_discovery("base", "AERO", http_get=http_get)
+
+    assert result["chain_type"] == "evm"
+    assert result["token_contract"] == "0xaero-contract"
+    assert result["quote_contract"] == "0xusdc-contract"
+    assert result["pool_address"] == "0xpair"
+
+
+def test_resolve_token_addresses_for_discovery_falls_back_to_first_chain_pair() -> None:
+    from sentinel.onchain_live_sources import resolve_token_addresses_for_discovery
+
+    def http_get(url: str, headers: dict[str, str], timeout: float) -> dict[str, object]:
+        _ = headers, timeout
+        return {
+            "pairs": [
+                {
+                    "chainId": "solana",
+                    "dexId": "raydium",
+                    "pairAddress": "pair-bonk-usdc",
+                    "baseToken": {"symbol": "BONK", "address": "bonk-mint"},
+                    "quoteToken": {"symbol": "USDC", "address": "usdc-mint"},
+                }
+            ]
+        }
+
+    result = resolve_token_addresses_for_discovery("solana", "BONK", http_get=http_get)
+    assert result["chain_type"] == "solana"
+    assert result["token_mint"] == "bonk-mint"
+
+
+def test_resolve_token_addresses_for_discovery_returns_empty_on_failure() -> None:
+    from sentinel.onchain_live_sources import resolve_token_addresses_for_discovery
+
+    def http_get(url: str, headers: dict[str, str], timeout: float) -> dict[str, object]:
+        raise RuntimeError("network error")
+
+    result = resolve_token_addresses_for_discovery("solana", "UNKNOWN", http_get=http_get)
+    assert result == {}
+
+
+def test_resolve_token_addresses_for_discovery_returns_empty_on_no_pairs() -> None:
+    from sentinel.onchain_live_sources import resolve_token_addresses_for_discovery
+
+    def http_get(url: str, headers: dict[str, str], timeout: float) -> dict[str, object]:
+        return {"pairs": []}
+
+    result = resolve_token_addresses_for_discovery("solana", "NOTHING", http_get=http_get)
+    assert result == {}
+
+
+# ── _build_source_from_profile ─────────────────────────────────────────────
+
+
+def test_build_source_from_profile_solana() -> None:
+    from sentinel.onchain_live_sources import _build_source_from_profile, SolanaWalletTradeSource
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    profile = MeasurementProfile(
+        profile_id="disc:test",
+        chain="solana",
+        token="TEST",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="test-evt",
+        registered_at=datetime.now(UTC),
+        token_mint="test-mint",
+        quote_mint="usdc-mint",
+        pool_address="pool-1",
+        chain_type="solana",
+    )
+
+    source = _build_source_from_profile(AppSettings.load(), profile)
+    assert source is not None
+    assert isinstance(source, SolanaWalletTradeSource)
+    assert source.config.token == "TEST"
+    assert source.config.token_mint == "test-mint"
+
+
+def test_build_source_from_profile_evm() -> None:
+    from sentinel.onchain_live_sources import _build_source_from_profile, EvmPoolSwapTradeSource
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    profile = MeasurementProfile(
+        profile_id="disc:test-evm",
+        chain="base",
+        token="AERO",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="test-evt",
+        registered_at=datetime.now(UTC),
+        token_contract="0xaero-ct",
+        quote_contract="0xusdc-ct",
+        pool_address="0xpool",
+        chain_type="evm",
+    )
+
+    source = _build_source_from_profile(AppSettings.load(), profile)
+    assert source is not None
+    assert isinstance(source, EvmPoolSwapTradeSource)
+    assert source.config.token == "AERO"
+
+
+def test_build_source_from_profile_returns_none_when_incomplete() -> None:
+    from sentinel.onchain_live_sources import _build_source_from_profile
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    profile = MeasurementProfile(
+        profile_id="disc:incomplete",
+        chain="solana",
+        token="INCOMPLETE",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="inc-evt",
+        registered_at=datetime.now(UTC),
+        chain_type="solana",
+        # missing token_mint, quote_mint
+    )
+
+    source = _build_source_from_profile(AppSettings.load(), profile)
+    assert source is None
+
+
+def test_build_source_from_profile_returns_none_for_unsupported_chain_type() -> None:
+    from sentinel.onchain_live_sources import _build_source_from_profile
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    profile = MeasurementProfile(
+        profile_id="disc:unknown",
+        chain="unknown",
+        token="XXX",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="unknown-evt",
+        registered_at=datetime.now(UTC),
+        chain_type=None,
+    )
+
+    source = _build_source_from_profile(AppSettings.load(), profile)
+    assert source is None
+
+
+# ── build_live_sources with registry ───────────────────────────────────────
+
+
+def test_build_live_sources_includes_registry_profiles() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry, _build_source_from_profile
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    settings = AppSettings.load()
+    registry = MeasurementProfileRegistry()
+
+    profile = MeasurementProfile(
+        profile_id="disc:reg-test",
+        chain="solana",
+        token="REGTOKEN",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="reg-evt",
+        registered_at=datetime.now(UTC),
+        token_mint="reg-mint",
+        quote_mint="usdc-mint",
+        pool_address="pool-reg",
+        chain_type="solana",
+    )
+    registry.register(profile)
+
+    sources = build_live_sources(settings, registry=registry)
+
+    profile_sources = [s for s in sources if "profile_" in s.config.source_name]
+    assert len(profile_sources) >= 1
+    assert profile_sources[0].config.token == "REGTOKEN"
+
+
+def test_build_live_sources_with_empty_registry_returns_static_sources_only() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+
+    settings = AppSettings.load().model_copy(
+        update={
+            "acquisition": {
+                "solana_wallet_trade": {
+                    "enabled": True,
+                    "wallet_address": "wallet-1",
+                    "token": "BONK",
+                    "token_mint": "token-mint",
+                    "quote_mint": "quote-mint",
+                },
+            }
+        }
+    )
+    registry = MeasurementProfileRegistry()
+
+    sources = build_live_sources(settings, registry=registry)
+
+    assert len(sources) == 1
+    assert isinstance(sources[0], SolanaWalletTradeSource)
+
+
+# ── Redis-backed MeasurementProfileRegistry ────────────────────────────────
+
+
+class _FakeRedis:
+    """Minimal Redis mock for testing persistence layer."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, bytes] = {}
+
+    def setex(self, key: str, seconds: int, value: str) -> None:
+        _ = seconds
+        self._data[key] = value.encode("utf-8")
+
+    def get(self, key: str) -> str | None:
+        raw = self._data.get(key)
+        return raw.decode("utf-8") if raw is not None else None
+
+    def delete(self, *keys: str) -> int:
+        count = 0
+        for key in keys:
+            if key in self._data:
+                del self._data[key]
+                count += 1
+        return count
+
+    def scan(self, cursor: int, *, match: str, count: int) -> tuple[int, list[str]]:
+        _ = cursor, count
+        import fnmatch
+
+        matching = [k for k in self._data if fnmatch.fnmatch(k, match)]
+        return 0, matching
+
+
+def test_registry_with_redis_persists_profile_on_register() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    fake = _FakeRedis()
+    registry = MeasurementProfileRegistry(redis_client=fake)  # type: ignore[arg-type]
+
+    profile = MeasurementProfile(
+        profile_id="disc:evt-1",
+        chain="solana",
+        token="TEST",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="evt-1",
+        registered_at=datetime.now(UTC),
+        token_mint="test-mint",
+        quote_mint="usdc-mint",
+        chain_type="solana",
+    )
+    registry.register(profile)
+
+    key = "measurement:profile:solana:TEST"
+    raw = fake.get(key)
+    assert raw is not None
+    assert '"token":"TEST"' in raw
+    assert '"chain":"solana"' in raw
+
+
+def test_registry_with_redis_loads_profiles_on_lazy_init() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    fake = _FakeRedis()
+    key = "measurement:profile:solana:TEST"
+
+    # Pre-populate Redis with a profile (simulating another worker's write)
+    profile = MeasurementProfile(
+        profile_id="disc:evt-2",
+        chain="solana",
+        token="TEST",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="evt-2",
+        registered_at=datetime.now(UTC),
+        token_mint="test-mint",
+        quote_mint="usdc-mint",
+        chain_type="solana",
+    )
+    fake.setex(key, 3600, profile.model_dump_json())
+
+    # Create a fresh registry — it should lazy-load from Redis on first access
+    registry = MeasurementProfileRegistry(redis_client=fake)  # type: ignore[arg-type]
+
+    fetched = registry.get("solana", "TEST")
+    assert fetched is not None
+    assert fetched.profile_id == "disc:evt-2"
+    assert fetched.token_mint == "test-mint"
+    assert fetched.chain_type == "solana"
+
+
+def test_registry_with_redis_skips_stale_profiles_on_load() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime, timedelta
+
+    fake = _FakeRedis()
+
+    # Stale profile (TTL expired relative to registered_at)
+    stale = MeasurementProfile(
+        profile_id="disc:stale",
+        chain="solana",
+        token="STALE",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="stale-evt",
+        registered_at=datetime.now(UTC) - timedelta(hours=2),
+        ttl_seconds=3600.0,
+        chain_type="solana",
+    )
+    fake.setex("measurement:profile:solana:STALE", 3600, stale.model_dump_json())
+
+    registry = MeasurementProfileRegistry(redis_client=fake)  # type: ignore[arg-type]
+
+    assert registry.get("solana", "STALE") is None
+    # stale should also be removed from Redis
+    assert fake.get("measurement:profile:solana:STALE") is None
+
+
+def test_registry_with_redis_cleanup_removes_stale_from_redis() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime, timedelta
+
+    fake = _FakeRedis()
+    registry = MeasurementProfileRegistry(redis_client=fake)  # type: ignore[arg-type]
+
+    stale = MeasurementProfile(
+        profile_id="disc:stale",
+        chain="solana",
+        token="STALE",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="stale-evt",
+        registered_at=datetime.now(UTC) - timedelta(hours=2),
+        ttl_seconds=3600.0,
+        chain_type="solana",
+    )
+    registry.register(stale)
+    assert fake.get("measurement:profile:solana:STALE") is not None
+
+    registry.cleanup()
+    assert registry.count() == 0
+    assert fake.get("measurement:profile:solana:STALE") is None
+
+
+def test_in_memory_registry_still_works_without_redis() -> None:
+    from sentinel.onchain_live_sources import MeasurementProfileRegistry
+    from core.schemas import MeasurementProfile
+    from datetime import UTC, datetime
+
+    registry = MeasurementProfileRegistry()  # no redis_client
+
+    profile = MeasurementProfile(
+        profile_id="disc:no-redis",
+        chain="solana",
+        token="MEMORY",
+        discovery_event_type="alpha.launch_candidate",
+        discovery_event_id="no-redis-evt",
+        registered_at=datetime.now(UTC),
+        chain_type="solana",
+    )
+    registry.register(profile)
+
+    assert registry.count() == 1
+    assert registry.get("solana", "MEMORY") is not None

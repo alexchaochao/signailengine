@@ -8,6 +8,7 @@ from typing import Any, Callable
 from urllib import parse
 
 import httpx
+from redis import Redis
 
 from core.config import (
     AcquisitionConfig,
@@ -21,6 +22,8 @@ from core.config import (
     SolanaWalletTradeSourceConfig,
     VenueConfig,
 )
+from core.schemas import EventEnvelope, MeasurementProfile
+from infra.redis_stream import acknowledge_message, ensure_consumer_group, read_group_models
 from execution.evm_rpc import _http_json_rpc_transport as _http_evm_json_rpc_transport
 from execution.solana_rpc import SolanaHttpTransportResponse, _http_json_rpc_transport
 
@@ -705,12 +708,375 @@ class EvmQuoteSource:
 
 
 
-def build_live_sources(settings: AppSettings) -> list[object]:
+class MeasurementProfileRegistry:
+    """Registry of temporary on-chain measurement profiles.
+
+    Profiles are registered from discovery events (launch/catalyst candidates)
+    and expire after *ttl_seconds*.  When a *redis_client* is provided, profiles
+    are persisted to Redis so they survive worker restarts and are shared across
+    workers.  Without Redis the registry operates purely in memory (test mode).
+    """
+
+    REDIS_KEY_PREFIX = "measurement:profile:"
+
+    def __init__(
+        self,
+        default_ttl_seconds: float = 3600.0,
+        *,
+        redis_client: Redis | None = None,
+        redis_key_prefix: str = REDIS_KEY_PREFIX,
+    ) -> None:
+        self._profiles: dict[str, MeasurementProfile] = {}
+        self._default_ttl = default_ttl_seconds
+        self._redis = redis_client
+        self._key_prefix = redis_key_prefix
+        self._loaded_from_redis = False
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def register(self, profile: MeasurementProfile) -> None:
+        key = f"{profile.chain}:{profile.token}"
+        existing = self._profiles.get(key)
+        if existing is not None and existing.profile_id == profile.profile_id:
+            return  # already registered
+        self._profiles[key] = profile
+        if self._redis is not None:
+            self._redis.setex(
+                self._redis_key(key),
+                int(profile.ttl_seconds),
+                profile.model_dump_json(),
+            )
+
+    def get(self, chain: str, token: str) -> MeasurementProfile | None:
+        self._lazy_load_from_redis()
+        profile = self._profiles.get(f"{chain}:{token}")
+        if profile is None:
+            return None
+        if self._is_stale(profile):
+            self._remove(chain, token)
+            return None
+        return profile
+
+    def active_profiles(self) -> list[MeasurementProfile]:
+        self._lazy_load_from_redis()
+        now = datetime.now(UTC)
+        active: list[MeasurementProfile] = []
+        stale_keys: list[str] = []
+        for key, profile in self._profiles.items():
+            if (now - profile.registered_at).total_seconds() > profile.ttl_seconds:
+                stale_keys.append(key)
+            else:
+                active.append(profile)
+        for raw_key in stale_keys:
+            chain, token = raw_key.split(":", 1)
+            self._remove(chain, token)
+        return active
+
+    def cleanup(self) -> None:
+        self.active_profiles()  # side-effect: removes stale entries
+
+    def count(self) -> int:
+        return len(self.active_profiles())
+
+    # ── Redis persistence ─────────────────────────────────────────────────
+
+    def _lazy_load_from_redis(self) -> None:
+        if self._redis is None or self._loaded_from_redis:
+            return
+        self._loaded_from_redis = True
+        cursor = 0
+        pattern = f"{self._key_prefix}*"
+        stale_redis_keys: list[str] = []
+        while True:
+            cursor, keys = self._redis.scan(cursor, match=pattern, count=100)
+            for redis_key in keys:
+                raw = self._redis.get(redis_key)
+                if raw is None:
+                    continue
+                try:
+                    data = json.loads(raw)
+                    profile = MeasurementProfile.model_validate(data)
+                    map_key = f"{profile.chain}:{profile.token}"
+                    if self._is_stale(profile):
+                        stale_redis_keys.append(redis_key)
+                    elif map_key not in self._profiles:
+                        self._profiles[map_key] = profile
+                except (json.JSONDecodeError, Exception):
+                    stale_redis_keys.append(redis_key)
+            if cursor == 0:
+                break
+        for stale_key in stale_redis_keys:
+            self._redis.delete(stale_key)
+
+    def _redis_key(self, profile_key: str) -> str:
+        return f"{self._key_prefix}{profile_key}"
+
+    def _remove(self, chain: str, token: str) -> None:
+        map_key = f"{chain}:{token}"
+        self._profiles.pop(map_key, None)
+        if self._redis is not None:
+            self._redis.delete(self._redis_key(map_key))
+
+    @staticmethod
+    def _is_stale(profile: MeasurementProfile) -> bool:
+        return (datetime.now(UTC) - profile.registered_at).total_seconds() > profile.ttl_seconds
+
+
+DISCOVERY_EVENTS_FOR_MEASUREMENT = frozenset(
+    {"alpha.launch_candidate", "alpha.catalyst_candidate"}
+)
+MEASUREMENT_CONSUMER_GROUP = "onchain-measurement"
+MEASUREMENT_CONSUMER_NAME = "onchain-measurement-1"
+
+
+def resolve_token_addresses_for_discovery(
+    chain: str,
+    token: str,
+    *,
+    http_get: Callable[[str, dict[str, str], float], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Resolve on-chain addresses for a token symbol using DexScreener search.
+
+    Returns a dict with keys that can be merged into a ``MeasurementProfile``:
+    ``pool_address``, ``token_mint``/``token_contract``, ``quote_mint``/``quote_contract``,
+    ``dex``, ``chain_type``.  Returns an empty dict when resolution fails.
+    """
+    transport = http_get or _http_json_get_transport
+    try:
+        payload = transport(
+            f"https://api.dexscreener.com/latest/dex/search?q={parse.quote(token)}",
+            {},
+            5.0,
+        )
+    except Exception:
+        return {}
+
+    pairs = payload.get("pairs") if isinstance(payload, dict) else None
+    if not isinstance(pairs, list) or not pairs:
+        return {}
+
+    normalized_chain = chain.lower()
+    best: dict[str, Any] | None = None
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        pair_chain = str(pair.get("chainId", "")).lower()
+        if pair_chain != normalized_chain:
+            continue
+        base = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+        base_symbol = str(base.get("symbol", "")).upper()
+        if base_symbol != token.upper():
+            continue
+        best = pair
+        break
+
+    if best is None:
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            if str(pair.get("chainId", "")).lower() != normalized_chain:
+                continue
+            best = pair
+            break
+
+    if best is None:
+        return {}
+
+    base = best.get("baseToken") if isinstance(best.get("baseToken"), dict) else {}
+    quote = best.get("quoteToken") if isinstance(best.get("quoteToken"), dict) else {}
+    base_address = str(base.get("address", "")) if base else ""
+    quote_address = str(quote.get("address", "")) if quote else ""
+
+    result: dict[str, Any] = {
+        "pool_address": best.get("pairAddress"),
+        "dex": best.get("dexId"),
+    }
+
+    if normalized_chain == "solana":
+        result["token_mint"] = base_address or None
+        result["quote_mint"] = quote_address or None
+        result["chain_type"] = "solana"
+    else:
+        result["token_contract"] = base_address or None
+        result["quote_contract"] = quote_address or None
+        result["chain_type"] = "evm"
+
+    return result
+
+
+def _build_source_from_profile(
+    settings: AppSettings,
+    profile: MeasurementProfile,
+) -> object | None:
+    """Build a single live source object from a resolved measurement profile.
+
+    Returns ``None`` when the profile lacks the addresses required for the
+    detected chain type.
+    """
+    if profile.chain_type == "solana":
+        if not profile.token_mint or not profile.quote_mint:
+            return None
+        wallet_config = SolanaWalletTradeSourceConfig(
+            enabled=True,
+            chain="solana",
+            token=profile.token,
+            token_mint=profile.token_mint,
+            quote_mint=profile.quote_mint,
+            pool_address=profile.pool_address or "",
+            source_name=f"profile_solana_wallet_{profile.token.lower()}",
+            checkpoint_key=f"acquisition:profile:solana:{profile.chain}:{profile.token}",
+        )
+        return SolanaWalletTradeSource(settings, wallet_config)
+
+    if profile.chain_type == "evm":
+        if not profile.token_contract or not profile.quote_contract:
+            return None
+        route_config = EvmLiveSourceConfig(
+            enabled=True,
+            chain=profile.chain,
+            token=profile.token,
+            token_contract=profile.token_contract,
+            quote_contract=profile.quote_contract,
+            pool_address=profile.pool_address or "",
+            source_name=f"profile_evm_pool_{profile.token.lower()}",
+            checkpoint_key=f"acquisition:profile:evm:{profile.chain}:{profile.token}",
+            source_type="pool_swap_trade",
+        )
+        return EvmPoolSwapTradeSource(settings, route_config)
+
+    return None
+
+
+def consume_discovery_events_for_measurement(
+    redis_client: Redis,
+    settings: AppSettings,
+    registry: MeasurementProfileRegistry,
+    *,
+    count: int = 20,
+    resolution_ttl_seconds: float = 3600.0,
+    http_get: Callable[[str, dict[str, str], float], dict[str, Any]] | None = None,
+) -> int:
+    """Read discovery events from the raw-events stream and register profiles.
+
+    Returns the number of newly registered profiles.
+    """
+    from infra.logging import get_logger
+
+    logger = get_logger("signalengine.onchain_measurement_consumer")
+
+    ensure_consumer_group(
+        redis_client,
+        settings.redis.raw_events_stream,
+        MEASUREMENT_CONSUMER_GROUP,
+    )
+    messages = read_group_models(
+        redis_client,
+        settings.redis.raw_events_stream,
+        MEASUREMENT_CONSUMER_GROUP,
+        MEASUREMENT_CONSUMER_NAME,
+        EventEnvelope,
+        count=count,
+        block_ms=100,
+    )
+    if not messages:
+        return 0
+
+    newly_registered = 0
+    for message_id, event in messages:
+        try:
+            if event.event_type not in DISCOVERY_EVENTS_FOR_MEASUREMENT:
+                continue
+
+            existing = registry.get(event.chain, event.token)
+            if existing is not None:
+                continue  # already have an active profile for this token
+
+            resolved = resolve_token_addresses_for_discovery(
+                event.chain,
+                event.token,
+                http_get=http_get,
+            )
+            if not resolved:
+                logger.info(
+                    "measurement_profile_resolution_failed",
+                    extra={
+                        "service": "onchain_measurement_consumer",
+                        "outcome": f"unresolved:{event.chain}:{event.token}",
+                        "event_type": event.event_type,
+                    },
+                )
+                continue
+
+            profile = MeasurementProfile(
+                profile_id=f"disc:{event.event_id}",
+                chain=event.chain,
+                token=event.token,
+                discovery_event_type=event.event_type,
+                discovery_event_id=event.event_id,
+                registered_at=datetime.now(UTC),
+                ttl_seconds=resolution_ttl_seconds,
+                pool_address=resolved.get("pool_address"),
+                token_mint=resolved.get("token_mint"),
+                quote_mint=resolved.get("quote_mint"),
+                token_contract=resolved.get("token_contract"),
+                quote_contract=resolved.get("quote_contract"),
+                dex=resolved.get("dex"),
+                chain_type=resolved.get("chain_type"),
+            )
+            registry.register(profile)
+            newly_registered += 1
+
+            logger.info(
+                "measurement_profile_registered",
+                extra={
+                    "service": "onchain_measurement_consumer",
+                    "outcome": f"registered:{profile.chain}:{profile.token}",
+                    "profile_id": profile.profile_id,
+                    "chain_type": profile.chain_type,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "measurement_consumer_event_failed",
+                extra={
+                    "service": "onchain_measurement_consumer",
+                    "outcome": event.event_id,
+                },
+            )
+        finally:
+            acknowledge_message(
+                redis_client,
+                settings.redis.raw_events_stream,
+                MEASUREMENT_CONSUMER_GROUP,
+                message_id,
+            )
+
+    return newly_registered
+
+
+def build_live_sources(
+    settings: AppSettings,
+    *,
+    registry: MeasurementProfileRegistry | None = None,
+) -> list[object]:
     acquisition = AcquisitionConfig.model_validate(settings.acquisition)
     sources: list[object] = []
-    if acquisition.solana_wallet_trade.enabled:
+
+    # 1. Registry-based profiles (event-driven measurement)
+    if registry is not None:
+        for profile in registry.active_profiles():
+            source = _build_source_from_profile(settings, profile)
+            if source is not None:
+                sources.append(source)
+
+    # 2. Static acquisition config (explicitly configured measurement routes)
+    if acquisition.solana_wallet_trade.enabled and _is_complete_solana_trade_source(
+        acquisition.solana_wallet_trade
+    ):
         sources.append(SolanaWalletTradeSource(settings, acquisition.solana_wallet_trade))
-    if acquisition.jupiter_quote.enabled:
+    if acquisition.jupiter_quote.enabled and _is_complete_jupiter_quote_source(
+        acquisition.jupiter_quote
+    ):
         sources.append(JupiterQuoteSource(settings, acquisition.jupiter_quote))
     for source_key, source_config in sorted(resolve_evm_routes(acquisition).items()):
         config = source_config.model_copy(
@@ -719,7 +1085,7 @@ def build_live_sources(settings: AppSettings) -> list[object]:
                 "checkpoint_key": source_config.checkpoint_key or f"acquisition:evm_sources:{source_key}",
             }
         )
-        if not config.enabled:
+        if not config.enabled or not _is_complete_evm_source(config):
             continue
         if config.source_type == "transfer_trade":
             sources.append(EvmTransferTradeSource(settings, config))
@@ -730,6 +1096,51 @@ def build_live_sources(settings: AppSettings) -> list[object]:
         else:
             raise ValueError(f"unsupported_evm_source_type:{config.source_type}")
     return sources
+
+
+def _has_value(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_complete_solana_trade_source(config: SolanaWalletTradeSourceConfig) -> bool:
+    has_identity = any(
+        _has_value(value)
+        for value in (config.signature_address, config.owner_address, config.wallet_address)
+    )
+    return (
+        has_identity
+        and _has_value(config.token)
+        and _has_value(config.token_mint)
+        and _has_value(config.quote_mint)
+    )
+
+
+def _is_complete_jupiter_quote_source(config: JupiterQuoteSourceConfig) -> bool:
+    return (
+        _has_value(config.token)
+        and _has_value(config.input_mint)
+        and _has_value(config.output_mint)
+    )
+
+
+def _is_complete_evm_source(config: EvmLiveSourceConfig) -> bool:
+    if not _has_value(config.token):
+        return False
+    if config.source_type == "transfer_trade":
+        return (
+            _has_value(config.wallet_address)
+            and _has_value(config.token_contract)
+            and _has_value(config.quote_contract)
+        )
+    if config.source_type == "pool_swap_trade":
+        return (
+            _has_value(config.pool_address)
+            and _has_value(config.token_contract)
+            and _has_value(config.quote_contract)
+        )
+    if config.source_type == "quote":
+        return _has_value(config.token_contract) and _has_value(config.quote_contract)
+    return False
 
 
 def _jupiter_headers(settings: AppSettings) -> dict[str, str]:

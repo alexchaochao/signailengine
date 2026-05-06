@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from core.schemas import (
     ActionType,
     ExecutionIntent,
+    FsmContext,
     PositionState,
     StateTransition,
     TokenSignal,
@@ -20,6 +21,7 @@ class RouteDecision(BaseModel):
     route: str
     reasons: list[str] = Field(default_factory=list)
     intent: ExecutionIntent | None = None
+    fsm_context: FsmContext | None = None
 
 
 class Router:

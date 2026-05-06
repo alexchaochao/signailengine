@@ -105,6 +105,36 @@ signalengine-launch-alpha-rehearsal --json
 signalengine-worker --catalyst-alpha-live --once
 ```
 
+16. Run social live sync once from configured Reddit-style social sources:
+
+```bash
+signalengine-worker --social-live --once
+```
+
+17. Run the event-driven social confirmation worker continuously:
+
+```bash
+signalengine-worker --social-confirmation-live
+```
+
+18. Run the event-driven social confirmation worker once against pending `social.query_requested` events:
+
+```bash
+signalengine-worker --social-confirmation-live --once
+```
+
+19. Run the social confirmation + LLM smoke path:
+
+```bash
+python -m replay.social_confirmation_smoke
+```
+
+20. Start the repository's local multi-worker stack:
+
+```bash
+./run_full_stack.sh
+```
+
 ## Project Layout
 
 ```text
@@ -125,6 +155,10 @@ signalengine/
 - Telegram publication is wired behind `alpha.candidate_qualified` events and currently publishes only first-time `QUALIFIED` `LAUNCH` and `CATALYST` candidates to one configured chat
 - live trading remains guarded behind environment and rollout controls; local credentials may enable live paths, but production hardening is still incomplete
 - social input remains effectively disabled as a first-class live signal source; message-surface coverage currently centers on exchange announcement and wallet-flow style inputs rather than broad social ingestion
+- Reddit-backed social snapshot ingestion is now available behind `acquisition.social_sources` and `signalengine-worker --social-live`, while broader X coverage still remains a follow-up task
+- `signalengine-worker --social-live` now supports both Reddit public search feeds and X snapshot JSON feeds; the X path expects a configurable external JSON bridge rather than hard-coded platform credentials
+- `signalengine-worker --social-confirmation-live` now consumes `social.query_requested`, enriches the fetched evidence with heuristic or remote LLM analysis, and feeds the result back through the existing catalyst-style candidate path
+- `./run_full_stack.sh` now starts both `social-live` and `social-confirmation` alongside the existing workers
 - the active next engineering items are persistent FSM state storage, message-source expansion, Alibaba Cloud production deployment planning, and observability hardening
 - no background worker processes are intentionally left running by default in the current handoff state; start only the workers you need for the next task
 
@@ -143,6 +177,28 @@ The worker now also:
 - supports a dedicated on-chain feature backfill mode that ingests JSONL trade and quote records, persists `raw_events`, rebuilds Phase A feature snapshots, and republishes normalized `onchain.liquidity_snapshot`
 - supports a dedicated on-chain feature live mode that polls configured real sources, persists normalized raw events, rebuilds feature snapshots, and republishes normalized `onchain.liquidity_snapshot`
 - supports a dedicated Telegram publisher worker mode that consumes `alpha.candidate_qualified` events from `raw-events`, deduplicates by candidate and channel, and delivers first-time qualified notifications to Telegram
+- supports a dedicated social confirmation worker mode that consumes `social.query_requested`, fetches platform evidence, applies deterministic plus optional remote LLM enrichment, and republishes `social.analysis_completed`
+
+## Social Confirmation And LLM
+
+The social path now has two operating modes:
+
+- `signalengine-worker --social-live` polls configured social sources as an observation feed
+- `signalengine-worker --social-confirmation-live` reacts to `social.query_requested` events emitted by the main pipeline on important FSM transitions
+
+Configuration notes:
+
+- `SIGNALENGINE_LLM__ENABLED=true` enables remote enrichment; when disabled the worker falls back to the built-in heuristic analyzer
+- `SIGNALENGINE_LLM__BASE_URL` should point to an OpenAI-compatible API root; the worker appends `/chat/completions`
+- `SIGNALENGINE_LLM__TIMEOUT_SECONDS=30.0` is a safer starting point for remote providers that return slower structured JSON responses than the local heuristic path
+- `SIGNALENGINE_POSTGRES__POOL_SIZE=1` and `SIGNALENGINE_POSTGRES__MAX_OVERFLOW=0` keep the full local worker stack inside a small PostgreSQL connection budget
+
+Suggested validation sequence:
+
+1. Start Redis and PostgreSQL with `docker compose up -d`
+2. Run `python -m replay.social_confirmation_smoke`
+3. Run `./run_full_stack.sh`
+4. Inspect `.run/full-stack/social-confirmation.log` and `.run/full-stack/worker.log`
 
 ## Current Handoff
 
@@ -279,7 +335,7 @@ Operational notes:
 Use the flow backfill path to publish normalized smart-money flow candidates into the existing signal pipeline.
 
 ```bash
-signalengine-worker --once --flow-alpha-backfill replay/datasets/flow_alpha_backfill.jsonl
+signalengine-worker --once --flow-measurement-backfill replay/datasets/flow_alpha_backfill.jsonl
 ```
 
 Operational notes:
@@ -393,41 +449,24 @@ export SIGNALENGINE_ACQUISITION__SOLANA_WALLET_TRADE__QUOTE_MINT="..."
 export SIGNALENGINE_ACQUISITION__JUPITER_QUOTE__ENABLED=true
 export SIGNALENGINE_ACQUISITION__JUPITER_QUOTE__INPUT_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 export SIGNALENGINE_ACQUISITION__JUPITER_QUOTE__OUTPUT_MINT="..."
-export SIGNALENGINE_ACQUISITION__JUPITER_QUOTE_ROUTES__SOLANA_BONK__CHAIN="solana"
-export SIGNALENGINE_ACQUISITION__JUPITER_QUOTE_ROUTES__SOLANA_BONK__TOKEN="BONK"
-export SIGNALENGINE_ACQUISITION__JUPITER_QUOTE_ROUTES__SOLANA_BONK__INPUT_MINT="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-export SIGNALENGINE_ACQUISITION__JUPITER_QUOTE_ROUTES__SOLANA_BONK__OUTPUT_MINT="..."
 export SIGNALENGINE_LIVE__CREDENTIALS__DEX_PROVIDERS__ZEROEX__API_KEY="..."
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__CHAIN_ID=8453
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__PROVIDER=evm_quote_api
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__API_PROVIDER=zeroex
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__QUOTE_API_URL="https://api.0x.org/swap/permit2/price"
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__PRICE_URL="https://api.dexscreener.com/latest/dex/tokens"
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__ENABLED=true
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__SOURCE_TYPE=quote
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__CHAIN=base
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__TOKEN=AERO
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__TOKEN_CONTRACT="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__QUOTE_CONTRACT="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__QUOTE_SLIPPAGE_BPS=100
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__ENABLED=true
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__SOURCE_TYPE=pool_swap_trade
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__CHAIN=base
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__POOL_ADDRESS="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__POOL_PROTOCOL=uniswap_v3
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__TOKEN=AERO
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__TOKEN_CONTRACT="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__QUOTE_CONTRACT="0x..."
 export SIGNALENGINE_LIVE__CREDENTIALS__DEX_PROVIDERS__ODOS__API_KEY="..."
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__API_PROVIDER=odos
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__QUOTE_API_URL="https://api.odos.xyz/sor/quote/v2"
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_ODOS_QUOTE__ENABLED=true
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_ODOS_QUOTE__SOURCE_TYPE=quote
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_ODOS_QUOTE__CHAIN=base
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_ODOS_QUOTE__TOKEN=AERO
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_ODOS_QUOTE__TOKEN_CONTRACT="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_ODOS_QUOTE__QUOTE_CONTRACT="0x..."
 ```
+
+Discovery design note:
+
+- operator-provided token watchlists are now considered a design bug for discovery modules
+- do not model RSS, CEX announcement, social discovery, or flow discovery as one configured source per token
+- token-specific route data is allowed only after a candidate asset has already been discovered and resolved
+- on-chain `solana_wallet_trade`, `jupiter_quote`, and `evm_routes` token fields should be treated as disabled measurement templates by default, not active discovery defaults
+- current examples that hard-code assets in `jupiter_quote_routes`, `evm_routes`, `flow_alpha_sources`, or token-scoped social sources should be treated as transitional implementation details, not the target operating model
 
 ## Architecture Decisions
 
@@ -477,21 +516,9 @@ export SIGNALENGINE_LIVE__CREDENTIALS__DEX_PROVIDERS__ZEROEX__API_KEY="..."
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__CHAIN_ID=8453
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__PROVIDER=evm_quote_api
 export SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__QUOTE_API_URL="https://api.0x.org/swap/permit2/price"
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__ENABLED=true
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__SOURCE_TYPE=quote
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__CHAIN=base
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__TOKEN=AERO
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__TOKEN_CONTRACT="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_QUOTE__QUOTE_CONTRACT="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__ENABLED=true
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__SOURCE_TYPE=pool_swap_trade
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__CHAIN=base
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__POOL_PROTOCOL=uniswap_v3
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__POOL_ADDRESS="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__TOKEN=AERO
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__TOKEN_CONTRACT="0x..."
-export SIGNALENGINE_ACQUISITION__EVM_ROUTES__BASE_POOL__QUOTE_CONTRACT="0x..."
 ```
+
+These EVM route examples are still token-scoped and remain acceptable only for execution-path validation. They should not be treated as the desired discovery architecture.
 
 5. Run one live polling cycle:
 

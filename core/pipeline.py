@@ -7,8 +7,8 @@ from time import perf_counter
 from redis import Redis
 from sqlalchemy.engine import Engine
 
-from core.config import AppSettings
-from core.event_flow import build_and_publish_signal, publish_decision_bundle
+from core.config import AcquisitionConfig, AppSettings
+from core.event_flow import build_and_publish_signal, publish_decision_bundle, publish_raw_events
 from core.router import RouteDecision, Router
 from core.schemas import (
     CollectorCheckpoint,
@@ -16,10 +16,13 @@ from core.schemas import (
     ExecutionIntent,
     ExecutionLedgerEntry,
     ExecutionReport,
+    FsmContext,
     PortfolioSnapshot,
     PositionState,
+    RawEventRecord,
     ReconciliationResult,
     RiskDecision,
+    SocialQueryRequest,
     StateTransition,
     TokenSignal,
     TokenState,
@@ -44,8 +47,14 @@ from infra.repository import RecoverableIntent, StorageRepository
 from portfolio.balance_provider import BalanceProvider
 from portfolio.factory import build_balance_provider
 from portfolio.risk_engine import RiskEngine
+from sentinel.social_live_sources import build_social_query_requested_event
 
 TERMINAL_ORDER_STATUSES = {"FILLED", "RECONCILED", "REJECTED"}
+SOCIAL_CONFIRMATION_TRIGGER_STATES = {
+    TokenState.PRE_LAUNCH,
+    TokenState.EARLY_LIQUIDITY,
+    TokenState.NARRATIVE_EXPLOSION,
+}
 
 
 @dataclass
@@ -185,6 +194,7 @@ class PipelineWorker:
             count=count,
         )
         if not messages:
+            self._update_stream_backlog(self.settings.redis.raw_events_stream)
             return []
 
         results: list[PipelineResult] = []
@@ -223,6 +233,7 @@ class PipelineWorker:
 
     def process_events(self, events: list[EventEnvelope]) -> PipelineResult:
         started_at = perf_counter()
+        self.metrics.mark_heartbeat(service="pipeline", mode="process_events")
         token = events[0].token
         chain = events[0].chain
         self._check_event_lag(events)
@@ -256,8 +267,15 @@ class PipelineWorker:
             signal,
             seconds_since_last_transition=seconds_since_last_transition,
         )
-        route = self.router.route(signal, transition, self.position_state, VenueStatus())
-        risk = self._evaluate_risk(signal, route)
+        fsm_context = _build_fsm_context(
+            signal,
+            transition,
+            last_transition_timestamp=last_transition_timestamp,
+        )
+        route = self.router.route(signal, transition, self.position_state, VenueStatus()).model_copy(
+            update={"fsm_context": fsm_context}
+        )
+        risk = self._evaluate_risk(signal, route).model_copy(update={"fsm_context": fsm_context})
         self._track_risk_alerts(signal, risk, route)
 
         duplicate_skipped = False
@@ -278,9 +296,12 @@ class PipelineWorker:
                 applied=False,
                 reasons=["duplicate_intent_skipped"],
                 timestamp=signal_timestamp(signal),
+                fsm_context=fsm_context,
             )
         else:
             execution = self._execute(route, risk, signal)
+            if execution is not None:
+                execution = execution.model_copy(update={"fsm_context": fsm_context})
             reconciliation = reconcile_execution(
                 self.position_state,
                 self.portfolio_snapshot,
@@ -288,6 +309,7 @@ class PipelineWorker:
                 risk,
                 execution,
             )
+            reconciliation = reconciliation.model_copy(update={"fsm_context": fsm_context})
             if reconciliation.applied:
                 self.position_state = reconciliation.position
                 self.portfolio_snapshot = reconciliation.portfolio
@@ -298,9 +320,11 @@ class PipelineWorker:
                 risk,
                 execution,
                 reconciliation,
+                fsm_context=fsm_context,
             )
 
         publish_decision_bundle(self.redis_client, self.settings, transition, route, risk)
+        self._emit_social_confirmation_requests(signal, transition, fsm_context)
         if execution is not None:
             self.redis_client.xadd(
                 self.settings.redis.executions_stream,
@@ -309,6 +333,10 @@ class PipelineWorker:
                     "payload": execution.model_dump_json(),
                 },
             )
+            self._update_stream_backlog(self.settings.redis.raw_events_stream)
+            self._update_stream_backlog(self.settings.redis.signals_stream)
+            self._update_stream_backlog(self.settings.redis.decisions_stream)
+            self._update_stream_backlog(self.settings.redis.executions_stream)
 
         result = PipelineResult(
             signal=signal,
@@ -358,6 +386,58 @@ class PipelineWorker:
         )
 
         return result
+
+    def _emit_social_confirmation_requests(
+        self,
+        signal: TokenSignal,
+        transition: StateTransition,
+        fsm_context: FsmContext,
+    ) -> None:
+        if not transition.changed or transition.new_state not in SOCIAL_CONFIRMATION_TRIGGER_STATES:
+            return
+
+        acquisition = AcquisitionConfig.model_validate(self.settings.acquisition)
+        for source_key, source_config in sorted(acquisition.social_sources.items()):
+            if not source_config.enabled:
+                continue
+
+            source_name = source_config.source_name or f"social_{source_key}"
+            request = SocialQueryRequest(
+                request_id=(
+                    f"fsm:{signal.chain}:{signal.token}:{transition.new_state.value}:"
+                    f"{transition.timestamp}:{source_name}"
+                ),
+                source_name=source_name,
+                platform=source_config.platform,
+                chain=signal.chain,
+                token=signal.token,
+                requested_at=signal_timestamp(signal),
+                candidate_id=f"social:{signal.chain}:{signal.token}",
+                fsm_context=fsm_context,
+                metadata={
+                    "trigger": "fsm_transition",
+                    "target_state": transition.new_state.value,
+                    "transition_timestamp": transition.timestamp,
+                },
+            )
+            event = build_social_query_requested_event(request, source_name=source_name)
+            if self.repository is not None:
+                existing = self.repository.raw_events.load(event.source, event.event_id)
+                if existing is not None:
+                    continue
+                self.repository.raw_events.save(
+                    RawEventRecord(
+                        source_type="social_query_request",
+                        source_name=event.source,
+                        source_event_id=event.event_id,
+                        chain=event.chain,
+                        token=event.token,
+                        observed_at=event.observed_at,
+                        ingested_at=event.ingested_at,
+                        payload=event.model_dump(mode="json"),
+                    )
+                )
+            publish_raw_events(self.redis_client, self.settings, event)
 
     def _load_fsm_checkpoint(
         self,
@@ -610,6 +690,16 @@ class PipelineWorker:
 
         self.consecutive_risk_rejections = 0
 
+    def _update_stream_backlog(self, stream_name: str) -> None:
+        xlen = getattr(self.redis_client, "xlen", None)
+        if not callable(xlen):
+            return
+        try:
+            backlog = int(xlen(stream_name))
+        except Exception:  # noqa: BLE001
+            return
+        self.metrics.redis_stream_backlog.labels(stream=stream_name).set(float(backlog))
+
 
 def signal_timestamp(signal: TokenSignal):
     from datetime import UTC, datetime
@@ -648,6 +738,8 @@ def _build_execution_ledger(
     risk: RiskDecision,
     execution: ExecutionReport | None,
     reconciliation: ReconciliationResult | None,
+    *,
+    fsm_context: FsmContext,
 ) -> list[ExecutionLedgerEntry]:
     if route.intent is None:
         return []
@@ -663,6 +755,7 @@ def _build_execution_ledger(
             notional_usd=risk.adjusted_notional_usd,
             message="intent_created",
             timestamp=signal_timestamp(signal),
+            fsm_context=fsm_context,
         )
     ]
 
@@ -678,6 +771,7 @@ def _build_execution_ledger(
                 notional_usd=0.0,
                 message=",".join(risk.violations) or "risk_rejected",
                 timestamp=risk.timestamp,
+                fsm_context=fsm_context,
             )
         )
         return ledger
@@ -694,6 +788,7 @@ def _build_execution_ledger(
                 notional_usd=execution.executed_notional_usd,
                 message=execution.message,
                 timestamp=execution.timestamp,
+                fsm_context=fsm_context,
             )
         )
 
@@ -709,10 +804,31 @@ def _build_execution_ledger(
                 notional_usd=risk.adjusted_notional_usd,
                 message="execution_reconciled",
                 timestamp=reconciliation.timestamp,
+                fsm_context=fsm_context,
             )
         )
 
     return ledger
+
+
+def _build_fsm_context(
+    signal: TokenSignal,
+    transition: StateTransition,
+    *,
+    last_transition_timestamp: int | None,
+) -> FsmContext:
+    effective_last_transition_timestamp = (
+        transition.timestamp if transition.changed else last_transition_timestamp
+    )
+    return FsmContext(
+        chain=signal.chain,
+        token=signal.token,
+        previous_state=transition.previous_state,
+        current_state=transition.new_state,
+        changed=transition.changed,
+        reasons=list(transition.reasons),
+        last_transition_timestamp=effective_last_transition_timestamp,
+    )
 
 
 def _build_recovery_ledger_entry(recoverable: RecoverableIntent) -> ExecutionLedgerEntry:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,7 +13,8 @@ from typing import Callable
 from urllib.error import URLError
 from urllib import request
 
-from core.config import AppSettings, CatalystAlphaLiveSourceConfig, CatalystTokenMatcherConfig
+from core.config import AppSettings, CatalystAlphaLiveSourceConfig
+from discovery.catalyst_entity_extractor import CatalystEntityExtractor
 from discovery.schemas import CatalystEventSnapshot
 
 CatalystHttpTransport = Callable[[str, float], str]
@@ -43,6 +43,7 @@ class RssCatalystSnapshotSource:
     ) -> None:
         self.settings = settings
         self.config = config
+        self.entity_extractor = CatalystEntityExtractor(settings, config)
         self.transport = transport or (
             lambda url, timeout_seconds: _http_text_get_transport(
                 url,
@@ -66,31 +67,33 @@ class RssCatalystSnapshotSource:
         for entry in entries[: self.config.max_entries]:
             if not self._passes_source_filters(entry, now=now):
                 continue
-            for token_config in self.config.token_configs:
-                if not _entry_matches_token(entry, token_config):
+            for entity in self.entity_extractor.extract(headline=entry.title, summary=entry.summary):
+                if not entity.token:
                     continue
                 snapshots.append(
                     CatalystEventSnapshot(
                         source_event_id=(
-                            f"rss:{self.config.source_name or 'catalyst_alpha'}:{token_config.chain}:"
-                            f"{token_config.token}:{entry.entry_id}"
+                            f"rss:{self.config.source_name or 'catalyst_alpha'}:{entity.chain}:"
+                            f"{entity.token}:{entry.entry_id}"
                         ),
-                        chain=token_config.chain,
-                        token=token_config.token,
-                        catalyst_type=token_config.catalyst_type,
+                        chain=entity.chain,
+                        token=entity.token,
+                        catalyst_type=entity.catalyst_type,
                         headline=entry.title,
                         observed_at=entry.published_at,
-                        impact_score=token_config.impact_score,
-                        credibility_score=token_config.credibility_score,
+                        impact_score=self.config.impact_score,
+                        credibility_score=self.config.credibility_score,
                         lead_time_minutes=0,
-                        venue=token_config.venue,
+                        venue=self.config.venue,
                         metadata={
                             "provider": self.config.provider,
                             "source_url": self.config.source_url,
                             "source_name": self.config.source_name,
                             "headline_summary": entry.summary,
                             "link": entry.link,
-                            **token_config.metadata,
+                            "project_name": entity.project_name,
+                            "entity_confidence": entity.confidence,
+                            "extraction_mode": self.config.extraction_mode,
                         },
                     )
                 )
@@ -314,18 +317,6 @@ def _parse_coinbase_html_entries(payload: str, *, source_name: str | None = None
             f"invalid_catalyst_feed_payload:{source_name or 'catalyst_alpha'}:no_article_cards"
         )
     return entries
-
-
-def _entry_matches_token(entry: _FeedEntry, token_config: CatalystTokenMatcherConfig) -> bool:
-    haystack = f"{entry.title} {entry.summary}".lower()
-    aliases = [token_config.token, *token_config.aliases]
-    return any(_contains_alias(haystack, alias) for alias in aliases if alias)
-
-
-def _contains_alias(haystack: str, alias: str) -> bool:
-    pattern = re.compile(rf"(?<![a-z0-9]){re.escape(alias.lower())}(?![a-z0-9])")
-    return pattern.search(haystack) is not None
-
 
 def _parse_datetime(value: str | None) -> datetime:
     if not value:

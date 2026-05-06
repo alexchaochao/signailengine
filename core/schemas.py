@@ -110,6 +110,7 @@ class RiskDecision(BaseModel):
     violations: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     timestamp: datetime
+    fsm_context: FsmContext | None = None
 
     @field_validator("adjusted_notional_usd")
     @classmethod
@@ -163,6 +164,30 @@ class StateTransition(BaseModel):
     timestamp: int
 
 
+class FsmContext(BaseModel):
+    chain: str
+    token: str
+    previous_state: TokenState
+    current_state: TokenState
+    changed: bool
+    reasons: list[str] = Field(default_factory=list)
+    last_transition_timestamp: int | None = None
+
+
+class SocialQueryRequest(BaseModel):
+    request_id: str
+    source_name: str | None = None
+    platform: str | None = None
+    chain: str
+    token: str
+    query: str | None = None
+    mode: str = "confirmation"
+    requested_at: datetime
+    candidate_id: str | None = None
+    fsm_context: FsmContext | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class ExecutionReport(BaseModel):
     schema_version: str = Field(default=SCHEMA_VERSION)
     intent_id: str
@@ -176,6 +201,7 @@ class ExecutionReport(BaseModel):
     message: str
     simulation: bool = False
     timestamp: datetime
+    fsm_context: FsmContext | None = None
 
 
 class ExecutionQuote(BaseModel):
@@ -210,6 +236,7 @@ class ExecutionLedgerEntry(BaseModel):
     notional_usd: float
     message: str
     timestamp: datetime
+    fsm_context: FsmContext | None = None
 
 
 class DeadLetterRecord(BaseModel):
@@ -231,6 +258,7 @@ class ReconciliationResult(BaseModel):
     applied: bool
     reasons: list[str] = Field(default_factory=list)
     timestamp: datetime
+    fsm_context: FsmContext | None = None
 
 
 class RawEventRecord(BaseModel):
@@ -334,3 +362,30 @@ class SlippageCurve(BaseModel):
     curve_version: str
     freshness_seconds: float
     updated_at: datetime | None = None
+
+
+class MeasurementProfile(BaseModel):
+    """Temporary on-chain measurement profile registered from a discovery event.
+
+    A profile links a discovered token (from launch/catalyst events) to
+    the on-chain addresses needed to build live measurement sources.
+    """
+
+    profile_id: str
+    chain: str
+    token: str
+    discovery_event_type: str
+    discovery_event_id: str
+    registered_at: datetime
+    ttl_seconds: float = 3600.0
+
+    # On-chain addresses — populated after resolution
+    pool_address: str | None = None
+    token_mint: str | None = None
+    quote_mint: str | None = None
+    token_contract: str | None = None
+    quote_contract: str | None = None
+    dex: str | None = None
+
+    # "solana" or "evm" — set after resolution
+    chain_type: str | None = None

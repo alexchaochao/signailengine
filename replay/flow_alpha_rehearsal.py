@@ -15,7 +15,7 @@ from core.event_flow import publish_raw_events
 from core.pipeline import PipelineWorker
 from core.schemas import PortfolioSnapshot, PositionState
 from discovery.flow_live_sources import build_flow_live_sources
-from discovery.service import FlowAlphaSyncService
+from discovery.service import FlowMeasurementSyncService
 from infra.postgres import get_engine, init_storage
 from infra.redis_stream import ensure_consumer_group, get_redis_client
 from infra.repository import StorageRepository
@@ -24,7 +24,7 @@ from sentinel.onchain_listener import build_onchain_event
 from sentinel.wallet_score_aggregator import WalletTokenFlow
 
 
-class FlowAlphaRehearsalStep(BaseModel):
+class FlowMeasurementRehearsalStep(BaseModel):
     token: str
     route: str
     state: str
@@ -32,14 +32,14 @@ class FlowAlphaRehearsalStep(BaseModel):
     execution_status: str | None = None
 
 
-class FlowAlphaRehearsalReport(BaseModel):
+class FlowMeasurementRehearsalReport(BaseModel):
     dataset: str
     seeded_wallets: int
     seeded_flows: int
     ingested_candidates: int
     supplemental_events: int
     processed_results: int
-    steps: list[FlowAlphaRehearsalStep] = Field(default_factory=list)
+    steps: list[FlowMeasurementRehearsalStep] = Field(default_factory=list)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_flow_alpha_rehearsal(
+def run_flow_measurement_rehearsal(
     settings: AppSettings,
     *,
     dataset_path: str | Path,
@@ -64,7 +64,7 @@ def run_flow_alpha_rehearsal(
     count: int = 50,
     redis_client: Redis | None = None,
     engine: Engine | None = None,
-) -> FlowAlphaRehearsalReport:
+) -> FlowMeasurementRehearsalReport:
     rehearsal_settings = _build_rehearsal_settings(settings)
     client = redis_client or get_redis_client(rehearsal_settings)
     db_engine = engine or get_engine(rehearsal_settings)
@@ -88,13 +88,13 @@ def run_flow_alpha_rehearsal(
     worker.position_state = PositionState()
     worker.portfolio_snapshot = PortfolioSnapshot()
 
-    service = FlowAlphaSyncService(rehearsal_settings, client, repository)
+    service = FlowMeasurementSyncService(rehearsal_settings, client, repository)
     ingested_candidates = 0
     for source in build_flow_live_sources(rehearsal_settings, repository):
         for snapshot in source.fetch_snapshots():
             service.ingest_snapshot(
                 snapshot.model_dump(mode="json"),
-                source_name=source.config.source_name or "flow_alpha_live",
+                source_name=source.config.source_name or "flow_measurement_live",
             )
             ingested_candidates += 1
 
@@ -107,7 +107,7 @@ def run_flow_alpha_rehearsal(
         )
 
     pipeline_results = worker.poll_once(rehearsal_group, consumer, count=count)
-    return FlowAlphaRehearsalReport(
+    return FlowMeasurementRehearsalReport(
         dataset=str(dataset_path),
         seeded_wallets=len(dataset.registry_entries),
         seeded_flows=len(dataset.wallet_flows),
@@ -115,7 +115,7 @@ def run_flow_alpha_rehearsal(
         supplemental_events=supplemental_events,
         processed_results=len(pipeline_results),
         steps=[
-            FlowAlphaRehearsalStep(
+            FlowMeasurementRehearsalStep(
                 token=result.signal.token,
                 route=result.route.route,
                 state=result.transition.new_state.value,
@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     settings = AppSettings.load()
-    report = run_flow_alpha_rehearsal(
+    report = run_flow_measurement_rehearsal(
         settings,
         dataset_path=args.dataset,
         group=args.group,

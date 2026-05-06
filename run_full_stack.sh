@@ -16,6 +16,8 @@ set +a
 
 start_service() {
   local name="$1"
+  local metrics_port="$2"
+  shift
   shift
   local log_file="${LOG_DIR}/${name}.log"
   local pid_file="${PID_DIR}/${name}.pid"
@@ -30,18 +32,20 @@ start_service() {
     rm -f "${pid_file}"
   fi
 
-  nohup "$@" >>"${log_file}" 2>&1 &
+  nohup env SIGNALENGINE_OBSERVABILITY__METRICS_PORT="${metrics_port}" "$@" >>"${log_file}" 2>&1 &
   local pid=$!
   echo "${pid}" >"${pid_file}"
   echo "started ${name} pid=${pid} log=${log_file}"
 }
 
-start_service worker python -m core.worker --group signal-workers --consumer worker-full
-start_service onchain-feature python -m core.worker --onchain-feature-live
-start_service launch-alpha python -m core.worker --launch-alpha-live
-start_service catalyst-alpha python -m core.worker --catalyst-alpha-live
-start_service flow-alpha python -m core.worker --flow-alpha-live
-start_service telegram-publisher python -m core.worker --telegram-publisher-live
-start_service wallet-intelligence python -m core.worker --wallet-intelligence-sync
+start_service worker 9000 python -m core.worker --group signal-workers --consumer worker-full
+start_service onchain-feature 9001 python -m core.worker --onchain-feature-live
+start_service launch-alpha 9002 python -m core.worker --launch-alpha-live
+start_service catalyst-alpha 9003 python -m core.worker --catalyst-alpha-live
+start_service flow-measurement 9004 python -m core.worker --flow-measurement-live
+start_service social-live 9005 python -m core.worker --social-live
+start_service social-confirmation 9006 python -m core.worker --social-confirmation-live --group social-confirmation --consumer social-confirmation-1
+start_service telegram-publisher 9007 python -m core.worker --telegram-publisher-live
+start_service wallet-intelligence 9008 python -m core.worker --wallet-intelligence-sync
 
 echo "logs: ${LOG_DIR}"

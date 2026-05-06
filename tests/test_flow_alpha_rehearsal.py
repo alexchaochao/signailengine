@@ -5,7 +5,7 @@ import os
 from sqlalchemy import create_engine
 
 from core.config import AppSettings
-from replay.flow_alpha_rehearsal import build_parser, run_flow_alpha_rehearsal
+from replay.flow_alpha_rehearsal import build_parser, run_flow_measurement_rehearsal
 from tests.test_pipeline import FakeRedis
 
 
@@ -28,7 +28,7 @@ def test_flow_alpha_rehearsal_parser_supports_json() -> None:
 def test_flow_alpha_rehearsal_runs_worker_end_to_end(monkeypatch) -> None:
     settings = _load_default_settings(monkeypatch)
     engine = create_engine("sqlite:///:memory:")
-    report = run_flow_alpha_rehearsal(
+    report = run_flow_measurement_rehearsal(
         settings,
         dataset_path="/home/alex/Desktop/signalengine/replay/datasets/flow_alpha_entry_rehearsal.jsonl",
         redis_client=FakeRedis(),

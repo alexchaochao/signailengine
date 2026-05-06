@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, start_http_server
 
 
@@ -143,6 +145,30 @@ class Metrics:
             namespace=namespace,
             registry=self.registry,
         )
+        self.worker_heartbeat = Gauge(
+            "worker_heartbeat_timestamp_seconds",
+            "Timestamp of the latest worker heartbeat",
+            ["service", "mode"],
+            namespace=namespace,
+            registry=self.registry,
+        )
+        self.redis_stream_backlog = Gauge(
+            "redis_stream_backlog_messages",
+            "Observed Redis stream message count",
+            ["stream"],
+            namespace=namespace,
+            registry=self.registry,
+        )
+        self.notification_deliveries = Counter(
+            "notification_deliveries_total",
+            "Count of notification deliveries by channel and status",
+            ["channel", "status"],
+            namespace=namespace,
+            registry=self.registry,
+        )
+
+    def mark_heartbeat(self, *, service: str, mode: str) -> None:
+        self.worker_heartbeat.labels(service=service, mode=mode).set(datetime.now(UTC).timestamp())
 
 
 def start_metrics_server(host: str, port: int) -> None:

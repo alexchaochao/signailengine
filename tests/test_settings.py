@@ -66,6 +66,9 @@ def test_settings_loads_yaml_defaults(monkeypatch) -> None:
         "base_quote",
         "ethereum_pool",
     }
+    assert set(settings.acquisition.social_sources.keys()) == {"reddit", "x"}
+    assert settings.acquisition.social_sources["x"].platform == "x"
+    assert settings.acquisition.social_sources["reddit"].platform == "reddit"
     assert settings.acquisition.evm_chains["base"].chain_id == 8453
     assert settings.acquisition.evm_sources["base_quote"].source_type == "quote"
     assert settings.acquisition.evm_sources["base_quote"].quote_slippage_bps == 100
@@ -75,7 +78,7 @@ def test_settings_loads_yaml_defaults(monkeypatch) -> None:
     assert resolved_evm_routes["base_quote"].chain_id == 8453
     assert resolved_evm_routes["base_quote"].api_provider == "zeroex"
     assert resolved_evm_routes["ethereum_pool"].provider == "evm_rpc_pool_swap_watch"
-    assert settings.acquisition.flow_alpha_sources["base_aero_wallet_flow"].observe_only is False
+    assert settings.acquisition.flow_alpha_sources["base_aero_wallet_flow"].observe_only is True
     assert settings.live.require_environment_separation is True
     assert settings.live.rollout.global_kill_switch_enabled is False
     assert settings.live.rollout.capped_notional_usd == 100.0
@@ -172,7 +175,7 @@ def test_environment_overrides_yaml(monkeypatch) -> None:
     )
     monkeypatch.setenv("SIGNALENGINE_LIVE__WALLET_INTELLIGENCE__CHAIN", "base")
     monkeypatch.setenv("SIGNALENGINE_LIVE__WALLET_INTELLIGENCE__CHAIN_INDEX", "8453")
-    monkeypatch.setenv("SIGNALENGINE_LIVE__WALLET_INTELLIGENCE__TOKEN", "AERO")
+    monkeypatch.setenv("SIGNALENGINE_LIVE__WALLET_INTELLIGENCE__MEASUREMENT_TOKEN", "AERO")
     monkeypatch.setenv("SIGNALENGINE_LIVE__CREDENTIALS__DEX_PROVIDERS__OKX__PROJECT_ID", "01")
     monkeypatch.setenv("SIGNALENGINE_LIVE__WALLET_INTELLIGENCE__RAW_EVENT_BATCH_SIZE", "250")
     monkeypatch.setenv("SIGNALENGINE_FEATURES__ONCHAIN__MIN_TRADE_COUNT_FOR_BUY_PRESSURE", "3")
@@ -215,6 +218,15 @@ def test_environment_overrides_yaml(monkeypatch) -> None:
     monkeypatch.setenv(
         "SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__CHAIN_ID",
         "8453",
+    )
+    monkeypatch.setenv("SIGNALENGINE_ACQUISITION__SOCIAL_SOURCES__X__ENABLED", "true")
+    monkeypatch.setenv(
+        "SIGNALENGINE_ACQUISITION__SOCIAL_SOURCES__X__QUERY_TEMPLATE",
+        "${cashtag} OR ${token}",
+    )
+    monkeypatch.setenv(
+        "SIGNALENGINE_ACQUISITION__SOCIAL_SOURCES__REDDIT__MIN_MENTIONS",
+        "3",
     )
     monkeypatch.setenv(
         "SIGNALENGINE_ACQUISITION__EVM_CHAINS__BASE__API_PROVIDER",
@@ -298,7 +310,7 @@ def test_environment_overrides_yaml(monkeypatch) -> None:
     assert settings.live.pricing.native_asset_sources["ethereum"].lookup_key == "ETHUSDT"
     assert settings.live.wallet_intelligence.chain == "base"
     assert settings.live.wallet_intelligence.chain_index == "8453"
-    assert settings.live.wallet_intelligence.token == "AERO"
+    assert settings.live.wallet_intelligence.measurement_token == "AERO"
     assert settings.live.wallet_intelligence.raw_event_batch_size == 250
     assert settings.features.onchain.min_trade_count_for_buy_pressure == 3
     assert settings.features.slippage.publication_notional_usd == 2500.0

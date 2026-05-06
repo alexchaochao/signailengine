@@ -23,6 +23,29 @@ This document closes that gap by defining a single architecture that covers:
 
 The target outcome is a system that does not depend on the user pre-selecting a token or pool. Instead, the system should discover candidate opportunities, score them, and pass only qualified candidates into the existing execution pipeline.
 
+## Discovery Blacklist
+
+The following design pattern is explicitly disallowed for all discovery-plane modules.
+
+- requiring the operator to pre-configure token symbols, pools, cashtags, or project aliases in order to discover alpha
+
+This is now treated as a discovery anti-pattern.
+
+The user should not need to know which token may move ahead of time. The repository must discover candidate assets first, then resolve identity, then run confirmation and execution.
+
+Blacklist examples:
+
+- token-scoped RSS or CEX announcement matching via static token allowlists
+- token-scoped social watchlists such as one `x_<token>_watch` source per asset
+- token-scoped flow sources such as one `flow_alpha_<token>` source per asset
+- token-scoped onchain discovery routes used as discovery entrypoints instead of confirmation sources
+
+Allowed use:
+
+- source-level discovery configuration for feeds, APIs, subscriptions, and transport credentials
+- entity extraction, symbol resolution, and candidate creation after raw source ingestion
+- token-specific execution routing only after a candidate has already been discovered and resolved
+
 ## Alpha Definition
 
 Alpha in this system is any token-level opportunity that satisfies at least one of the following conditions.
@@ -50,6 +73,8 @@ Examples:
 - partnership, buyback, unlock, treasury action
 - large increase in X discussion or narrative intensity
 
+Catalyst discovery must not depend on static token matcher configuration. Announcement and RSS sources should emit raw source records first, then extract entities and catalyst structure, then open or update candidates.
+
 ### 3. Flow Alpha
 
 Applies when the token is not new, but market participants or transaction flow change materially.
@@ -62,7 +87,11 @@ Examples:
 - anomalous buyer expansion
 - mempool pressure from large pending swaps
 
+Flow alpha should be treated as a discovery layer only when it can identify assets from wallet or transaction activity without a pre-configured token list. If a flow source needs a known token to operate, it belongs to confirmation or measurement, not discovery.
+
 These three categories must feed the same downstream evaluation and execution framework.
+
+For the detailed social retrieval, LLM enrichment, and candidate emission design, see [docs/social-llm-alpha-pipeline.md](./social-llm-alpha-pipeline.md).
 
 ## Architectural Principle
 
@@ -209,6 +238,12 @@ Primary signals:
 - unique buyer expansion
 - abnormal buy/sell imbalance
 
+Design constraint:
+
+- do not model flow discovery as one static source per token
+- discover the asset from observed flow first, then create a candidate
+- only use token-specific flow reads as downstream confirmation after candidate creation
+
 Output event family:
 
 - `alpha.flow_candidate`
@@ -219,6 +254,7 @@ Purpose:
 
 - classify addresses and entities that influence the quality of a candidate
 - enrich launch and flow candidates with contextual identity hints
+- resolve asset symbols and project identities extracted from announcements, social text, wallet flow, and onchain records
 
 Examples:
 
@@ -256,6 +292,8 @@ This should be designed now but implemented later.
 All discovery modules must converge into one shared candidate model.
 
 This is the architectural center of the redesigned alpha system.
+
+All discovery entrypoints should converge here before any token-specific execution configuration is consulted.
 
 ### Candidate Lifecycle
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from urllib.error import URLError
 
-from core.config import AppSettings, CatalystAlphaLiveSourceConfig, CatalystTokenMatcherConfig
+from core.config import AppSettings, CatalystAlphaLiveSourceConfig
 from discovery.catalyst_live_sources import (
   InvalidCatalystFeedError,
   RssCatalystSnapshotSource,
@@ -37,14 +37,8 @@ def test_catalyst_live_source_builds_snapshots_from_rss_feed() -> None:
         enabled=True,
         source_name="catalyst_alpha_binance",
         source_url="https://example.invalid/rss",
-        token_configs=[
-            CatalystTokenMatcherConfig(
-                token="AERO",
-                chain="base",
-                aliases=["Aerodrome"],
-                venue="binance",
-            )
-        ],
+      venue="binance",
+      default_chain="base",
     )
 
     source = RssCatalystSnapshotSource(
@@ -59,6 +53,7 @@ def test_catalyst_live_source_builds_snapshots_from_rss_feed() -> None:
     assert snapshots[0].token == "AERO"
     assert snapshots[0].venue == "binance"
     assert snapshots[0].catalyst_type == "cex_listing_announcement"
+    assert snapshots[0].metadata["project_name"] == "Aerodrome"
 
 
 def test_catalyst_live_source_filters_stale_and_excluded_entries() -> None:
@@ -86,13 +81,7 @@ def test_catalyst_live_source_filters_stale_and_excluded_entries() -> None:
         source_name="catalyst_alpha_feed",
         source_url="https://example.invalid/feed",
         max_snapshot_age_minutes=60,
-        token_configs=[
-            CatalystTokenMatcherConfig(
-                token="ARB",
-                chain="arbitrum",
-                aliases=["Arbitrum"],
-            )
-        ],
+      default_chain="arbitrum",
     )
 
     source = RssCatalystSnapshotSource(
@@ -124,15 +113,9 @@ def test_catalyst_live_source_matches_second_real_source_style() -> None:
         source_name="catalyst_alpha_coinbase",
         source_url="https://example.invalid/feed",
         required_keywords=["list", "listing", "roadmap", "asset"],
-        token_configs=[
-            CatalystTokenMatcherConfig(
-                token="ARB",
-                chain="arbitrum",
-                aliases=["Arbitrum"],
-                venue="coinbase",
-                credibility_score=0.88,
-            )
-        ],
+      venue="coinbase",
+      default_chain="arbitrum",
+      credibility_score=0.88,
     )
 
     source = RssCatalystSnapshotSource(
@@ -153,13 +136,6 @@ def test_catalyst_live_source_rejects_empty_feed_payload() -> None:
         enabled=True,
         source_name="catalyst_alpha_empty",
         source_url="https://example.invalid/feed",
-        token_configs=[
-            CatalystTokenMatcherConfig(
-                token="ARB",
-                chain="arbitrum",
-                aliases=["Arbitrum"],
-            )
-        ],
     )
 
     source = RssCatalystSnapshotSource(
@@ -181,13 +157,6 @@ def test_catalyst_live_source_rejects_html_feed_payload() -> None:
         enabled=True,
         source_name="catalyst_alpha_html",
         source_url="https://example.invalid/feed",
-        token_configs=[
-            CatalystTokenMatcherConfig(
-                token="ARB",
-                chain="arbitrum",
-                aliases=["Arbitrum"],
-            )
-        ],
     )
 
     source = RssCatalystSnapshotSource(
@@ -229,14 +198,8 @@ def test_catalyst_live_source_builds_snapshots_from_binance_cms_payload() -> Non
         source_name="catalyst_alpha_binance",
         source_url="https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=20",
       max_snapshot_age_minutes=100000,
-        token_configs=[
-            CatalystTokenMatcherConfig(
-                token="ARB",
-                chain="arbitrum",
-                aliases=["Arbitrum"],
-                venue="binance",
-            )
-        ],
+      venue="binance",
+      default_chain="arbitrum",
     )
 
     source = RssCatalystSnapshotSource(
@@ -264,14 +227,8 @@ def test_catalyst_live_source_builds_snapshots_from_coinbase_html_cards() -> Non
         provider="coinbase_html_page",
         source_name="catalyst_alpha_coinbase",
         source_url="https://blog.coinbase.com/feed",
-        token_configs=[
-            CatalystTokenMatcherConfig(
-                token="ARB",
-                chain="arbitrum",
-                aliases=["Arbitrum"],
-                venue="coinbase",
-            )
-        ],
+      venue="coinbase",
+      default_chain="arbitrum",
     )
 
     source = RssCatalystSnapshotSource(

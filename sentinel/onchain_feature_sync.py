@@ -139,23 +139,32 @@ class OnchainFeatureSyncService:
             raw_event = self.repository.raw_events.load(source_name, collector_result.source_event_id)
             if raw_event is None:
                 raise RuntimeError("missing_trade_raw_event")
-            publish_raw_events(
-                self.redis_client,
-                self.settings,
-                build_onchain_trade_event(
-                    {
-                        "chain": str(payload.get("chain", "solana")),
-                        "token": str(payload["token"]),
-                        "wallet_address": str(payload["wallet_address"]),
-                        "direction": _trade_direction(payload.get("side")),
-                        "notional_usd": float(payload.get("quote_amount_usd", 0.0)),
-                        "trade_count": 1,
-                        "observed_at": payload.get("observed_at"),
-                        "event_id": collector_result.source_event_id,
-                    },
-                    source=source_name,
-                ),
-            )
+
+            # Only publish onchain.trade_fact for trades above the minimum
+            # notional threshold.  Micro-trades still update aggregator features
+            # (buy pressure etc.) but are skipped from the stream to reduce
+            # noise in downstream consumers such as wallet intelligence.
+            notional_usd = float(payload.get("quote_amount_usd", 0.0))
+            min_trade_notional = self.settings.features.onchain.min_trade_notional_usd
+            if notional_usd >= min_trade_notional:
+                publish_raw_events(
+                    self.redis_client,
+                    self.settings,
+                    build_onchain_trade_event(
+                        {
+                            "chain": str(payload.get("chain", "solana")),
+                            "token": str(payload["token"]),
+                            "wallet_address": str(payload["wallet_address"]),
+                            "direction": _trade_direction(payload.get("side")),
+                            "notional_usd": notional_usd,
+                            "trade_count": 1,
+                            "observed_at": payload.get("observed_at"),
+                            "event_id": collector_result.source_event_id,
+                        },
+                        source=source_name,
+                    ),
+                )
+
             snapshots = self.onchain_aggregator.ingest_raw_trade(raw_event)
             _, published_message_id = self.publisher.publish_latest(
                 str(payload.get("chain", "solana")),

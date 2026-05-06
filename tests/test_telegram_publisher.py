@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from core.config import AppSettings
 from core.event_flow import publish_raw_events
 from core.schemas import CollectorCheckpoint, EventEnvelope
+from infra.metrics import Metrics
 from infra.postgres import count_rows, init_storage
 from infra.repository import StorageRepository
 from notifications.telegram_publisher import TelegramPublisherService
@@ -34,6 +35,7 @@ def test_telegram_publisher_sends_qualified_launch_candidate_once() -> None:
         }
     )
     client = FakeRedis()
+    metrics = Metrics(settings.observability.service_namespace)
     sent_messages: list[tuple[str, str, str]] = []
 
     def transport(bot_token: str, chat_id: str, text: str) -> str:
@@ -45,6 +47,7 @@ def test_telegram_publisher_sends_qualified_launch_candidate_once() -> None:
         cast(Redis, client),
         repository,
         transport=transport,
+        metrics=metrics,
     )
     service.ensure_stream()
     publish_raw_events(
@@ -94,6 +97,8 @@ def test_telegram_publisher_sends_qualified_launch_candidate_once() -> None:
     assert delivery is not None
     assert delivery["status"] == "sent"
     assert delivery["remote_message_id"] == "42"
+    assert metrics.notification_deliveries.labels(channel="telegram", status="sent")._value.get() == 1.0
+    assert metrics.worker_heartbeat.labels(service="telegram_publisher", mode="process_once")._value.get() > 0.0
 
 
 def test_telegram_publisher_skips_flow_candidate_by_default() -> None:
@@ -115,6 +120,7 @@ def test_telegram_publisher_skips_flow_candidate_by_default() -> None:
         }
     )
     client = FakeRedis()
+    metrics = Metrics(settings.observability.service_namespace)
     sent_messages: list[str] = []
 
     def transport(bot_token: str, chat_id: str, text: str) -> str:
@@ -127,6 +133,7 @@ def test_telegram_publisher_skips_flow_candidate_by_default() -> None:
         cast(Redis, client),
         repository,
         transport=transport,
+        metrics=metrics,
     )
     service.ensure_stream()
     publish_raw_events(
@@ -163,6 +170,66 @@ def test_telegram_publisher_skips_flow_candidate_by_default() -> None:
     )
     assert delivery is not None
     assert delivery["status"] == "skipped"
+    assert metrics.notification_deliveries.labels(channel="telegram", status="skipped")._value.get() == 1.0
+
+
+def test_telegram_publisher_tracks_failed_delivery_metric() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    init_storage(engine)
+    repository = StorageRepository(engine)
+    settings = AppSettings.load().model_copy(
+        update={
+            "notifications": {
+                "telegram": {
+                    "enabled": True,
+                    "bot_token": "token-1",
+                    "chat_id": "chat-1",
+                    "publish_alpha_types": ["LAUNCH"],
+                    "consumer_group": "telegram-test",
+                    "consumer_name": "telegram-test-1",
+                }
+            }
+        }
+    )
+    client = FakeRedis()
+    metrics = Metrics(settings.observability.service_namespace)
+
+    def failing_transport(bot_token: str, chat_id: str, text: str) -> str:
+        _ = bot_token, chat_id, text
+        raise RuntimeError("telegram_unreachable")
+
+    service = TelegramPublisherService(
+        settings,
+        cast(Redis, client),
+        repository,
+        transport=failing_transport,
+        metrics=metrics,
+    )
+    service.ensure_stream()
+    publish_raw_events(
+        cast(Redis, client),
+        settings,
+        EventEnvelope(
+            event_id="launch-fail:qualified",
+            event_type="alpha.candidate_qualified",
+            source="launch_alpha_live",
+            chain="solana",
+            token="NEWTKN",
+            observed_at=datetime(2026, 5, 3, 12, 0, tzinfo=UTC),
+            ingested_at=datetime(2026, 5, 3, 12, 0, 1, tzinfo=UTC),
+            payload={
+                "alpha_type": "LAUNCH",
+                "candidate_id": "solana:pool-fail",
+                "status": "QUALIFIED",
+                "score": 0.95,
+                "candidate": {"dex": "raydium", "pool_address": "pool-fail"},
+                "snapshot": {},
+            },
+        ),
+    )
+
+    assert service.process_once(count=10, block_ms=1) == 1
+    assert metrics.notification_deliveries.labels(channel="telegram", status="failed")._value.get() == 1.0
 
 
 def test_telegram_publisher_includes_fsm_context_when_available() -> None:

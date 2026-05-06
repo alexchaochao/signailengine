@@ -55,6 +55,9 @@ class FakeRedis:
         self.acked.append((stream_name, group_name, message_id))
         return 1
 
+    def xlen(self, stream_name: str) -> int:
+        return len(self.streams.get(stream_name, []))
+
 
 def test_worker_updates_metrics_for_processed_batch() -> None:
     configure_logging("INFO")
@@ -87,6 +90,10 @@ def test_worker_updates_metrics_for_processed_batch() -> None:
 
     assert metrics.pipeline_runs.labels(outcome="executed")._value.get() == 1.0
     assert metrics.execution_reports.labels(venue="DEX", status="FILLED")._value.get() == 1.0
+    assert metrics.worker_heartbeat.labels(service="pipeline", mode="process_events")._value.get() > 0.0
+    assert metrics.redis_stream_backlog.labels(stream=settings.redis.signals_stream)._value.get() == 1.0
+    assert metrics.redis_stream_backlog.labels(stream=settings.redis.decisions_stream)._value.get() == 3.0
+    assert metrics.redis_stream_backlog.labels(stream=settings.redis.executions_stream)._value.get() == 1.0
 
 
 def test_worker_emits_event_lag_and_risk_rejection_alerts() -> None:

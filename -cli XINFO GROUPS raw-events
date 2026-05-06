@@ -1,0 +1,5 @@
+ intent_id |                                                                                   payload                                                                                    
+-----------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ none      | {"schema_version":"v1","intent_id":"none","allowed":false,"adjusted_notional_usd":0.0,"violations":["no_execution_intent"],"warnings":[],"timestamp":"2026-05-03T12:01:00Z"}
+(1 row)
+

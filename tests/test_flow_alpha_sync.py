@@ -10,7 +10,7 @@ from sqlalchemy import create_engine
 from core.config import AppSettings
 from core.schemas import EventEnvelope
 from discovery.schemas import AlphaCandidateStatus, AlphaType
-from discovery.service import FlowAlphaSyncService
+from discovery.service import FlowMeasurementSyncService
 from infra.postgres import count_rows, init_storage
 from infra.redis_stream import read_models
 from infra.repository import StorageRepository
@@ -23,7 +23,7 @@ def test_flow_alpha_sync_service_ingests_snapshot() -> None:
     repository = StorageRepository(engine)
     settings = AppSettings.load()
     client = FakeRedis()
-    service = FlowAlphaSyncService(settings, cast(Redis, client), repository)
+    service = FlowMeasurementSyncService(settings, cast(Redis, client), repository)
 
     result = service.ingest_snapshot(
         {
@@ -59,7 +59,7 @@ def test_flow_alpha_sync_service_can_run_observe_only() -> None:
     repository = StorageRepository(engine)
     settings = AppSettings.load()
     client = FakeRedis()
-    service = FlowAlphaSyncService(settings, cast(Redis, client), repository)
+    service = FlowMeasurementSyncService(settings, cast(Redis, client), repository)
 
     result = service.ingest_snapshot(
         {
@@ -95,7 +95,7 @@ def test_flow_alpha_sync_service_ingests_jsonl_records(tmp_path) -> None:
     repository = StorageRepository(engine)
     settings = AppSettings.load()
     client = FakeRedis()
-    service = FlowAlphaSyncService(settings, cast(Redis, client), repository)
+    service = FlowMeasurementSyncService(settings, cast(Redis, client), repository)
     input_path = tmp_path / "flow_backfill.jsonl"
     input_path.write_text(
         json.dumps(
@@ -134,7 +134,7 @@ def test_flow_alpha_sync_reuses_stable_candidate_identity_for_same_market() -> N
     repository = StorageRepository(engine)
     settings = AppSettings.load()
     client = FakeRedis()
-    service = FlowAlphaSyncService(settings, cast(Redis, client), repository)
+    service = FlowMeasurementSyncService(settings, cast(Redis, client), repository)
 
     first = service.ingest_snapshot(
         {
