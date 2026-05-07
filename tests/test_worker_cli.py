@@ -714,7 +714,7 @@ def test_catalyst_alpha_live_sync_returns_zero_and_deduplicates(monkeypatch) -> 
     monkeypatch.setattr("core.worker.init_storage", lambda engine: None)
     monkeypatch.setattr("core.worker.StorageRepository", lambda engine: StubRepository())
     monkeypatch.setattr("core.worker.CatalystAlphaSyncService", StubService)
-    monkeypatch.setattr("core.worker.build_catalyst_live_sources", lambda settings: [StubSource()])
+    monkeypatch.setattr("core.worker.build_catalyst_live_sources", lambda settings, **kwargs: [StubSource()])
 
     assert run_catalyst_alpha_live_sync(AppSettings.load()) == 0
     assert calls.count("fetch_snapshots") == 1
@@ -760,7 +760,7 @@ def test_catalyst_alpha_live_sync_returns_zero_on_source_failure(monkeypatch) ->
     monkeypatch.setattr("core.worker.init_storage", lambda engine: None)
     monkeypatch.setattr("core.worker.StorageRepository", lambda engine: StubRepository())
     monkeypatch.setattr("core.worker.CatalystAlphaSyncService", StubService)
-    monkeypatch.setattr("core.worker.build_catalyst_live_sources", lambda settings: [StubSource()])
+    monkeypatch.setattr("core.worker.build_catalyst_live_sources", lambda settings, **kwargs: [StubSource()])
 
     assert run_catalyst_alpha_live_sync(AppSettings.load()) == 0
     assert calls.count("fetch_snapshots") == 1
@@ -781,7 +781,7 @@ def test_catalyst_alpha_live_sync_skips_source_in_cooldown(monkeypatch) -> None:
     monkeypatch.setattr("core.worker.init_storage", lambda engine: None)
     monkeypatch.setattr("core.worker.StorageRepository", lambda engine: object())
     monkeypatch.setattr("core.worker.CatalystAlphaSyncService", lambda settings, redis_client, repository: object())
-    monkeypatch.setattr("core.worker.build_catalyst_live_sources", lambda settings: [StubSource()])
+    monkeypatch.setattr("core.worker.build_catalyst_live_sources", lambda settings, **kwargs: [StubSource()])
     monkeypatch.setattr(
         "core.worker._load_live_source_state",
         lambda repository, source_name: type(

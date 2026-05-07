@@ -250,16 +250,28 @@ class LaunchAlphaLiveSourceConfig(BaseModel):
     min_unique_wallets_5m: int = 4
     min_liquidity_lock_ratio: float = 0.8
     max_creator_hold_pct: float = 0.2
+    # ── Rug / pool-quality filters ────────────────────────────────────────
+    # Minimum deployer age in days to filter out fresh-created scam pools
+    min_deployer_age_days: int = 30
+    # Require honeypot simulation result to be False (token is tradeable)
+    require_honeypot_sim: bool = True
+    # Require mint authority to be revoked (no further token minting)
+    require_mint_revoked: bool = True
+    # Require deployer has transferred LP tokens (liquidity not fully held by creator)
+    require_creator_lp_transfer: bool = True
 
 
 class CatalystAlphaLiveSourceConfig(BaseModel):
     enabled: bool = False
     provider: str = "rss_keyword_feed"
     source_name: str | None = None
-    source_url: str
+    source_url: str = ""
     timeout_seconds: float = 5.0
     retry_attempts: int = 3
     retry_backoff_seconds: float = 0.5
+    # Per-source polling interval. Fast sources (exchangeInfo, WS) use 0.5~2s;
+    # announcement/CMS sources use 30~60s. Falls back to acquisition.sync_interval_seconds.
+    sync_interval_seconds: float | None = None
     max_entries: int = 25
     max_snapshot_age_minutes: int = 360
     required_keywords: list[str] = Field(
@@ -275,6 +287,11 @@ class CatalystAlphaLiveSourceConfig(BaseModel):
     credibility_score: float = 0.9
     extraction_mode: str = "llm_with_heuristic_fallback"
     extraction_max_entities: int = 3
+    # Redis dedup: mark processed entries to avoid repeats
+    dedup_enabled: bool = True
+    dedup_ttl_hours: int = 24 * 7  # 7 days
+    # Multi-chain address resolution
+    resolve_multi_chain: bool = False
 
 
 class FlowAlphaBackfillConfig(BaseModel):
@@ -493,6 +510,22 @@ class WalletIntelligenceSyncConfig(BaseModel):
         return str(value)
 
 
+class AlphaCollectorConfig(BaseModel):
+    """Configuration for the async cross-dimension data collector.
+
+    Controls how the system collects on-chain, wallet, and social data
+    after an alpha.candidate_qualified event is emitted.
+    """
+    enabled: bool = False
+    timeout_seconds: float = 30.0
+    max_chains_per_token: int = 1
+    priority_chains: list[str] = Field(
+        default_factory=lambda: ["solana", "base", "ethereum", "bsc"]
+    )
+    collection_cooldown_seconds: int = 300
+    dexscreener_api_url: str = "https://api.dexscreener.com/latest/dex/tokens"
+
+
 class LiveConfig(BaseModel):
     require_environment_separation: bool = True
     rollout: LiveRolloutConfig = Field(default_factory=LiveRolloutConfig)
@@ -564,6 +597,7 @@ class AppSettings(BaseModel):
     features: FeatureConfig = Field(default_factory=FeatureConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     acquisition: AcquisitionConfig = Field(default_factory=AcquisitionConfig)
+    alpha_collector: AlphaCollectorConfig = Field(default_factory=AlphaCollectorConfig)
     live: LiveConfig = Field(default_factory=LiveConfig)
     llm: LlmConfig = Field(default_factory=LlmConfig)
     venues: VenueConfig = Field(default_factory=VenueConfig)

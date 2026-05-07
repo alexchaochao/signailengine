@@ -59,6 +59,11 @@ Constraint:
 - do not create one configured watch source per token
 - if the platform requires a token-specific query to return useful data, use it only in confirmation mode after another discovery module has produced an entity candidate
 
+Implementation note:
+
+- discovery-mode snapshots now carry `retrieval_mode=discovery`
+- the live source may derive a token from the retrieved text when the provider does not require a preconfigured token, but the resulting event still stays out of the execution pipeline until confirmation or candidate qualification occurs
+
 Primary output:
 
 - `alpha.candidate_opened`
@@ -87,6 +92,7 @@ Current direction for this repository:
 - keep social confirmation mode
 - remove static token-scoped social source configuration from discovery mode
 - only form token-specific queries from upstream candidate identity or FSM context
+- keep discovery-mode raw snapshots on the event bus, but exclude them from the signal → route → execute path
 
 ## High-Level Architecture
 

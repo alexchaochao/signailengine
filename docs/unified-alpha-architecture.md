@@ -93,6 +93,12 @@ These three categories must feed the same downstream evaluation and execution fr
 
 For the detailed social retrieval, LLM enrichment, and candidate emission design, see [docs/social-llm-alpha-pipeline.md](./social-llm-alpha-pipeline.md).
 
+For the current DEX/CEX listing-alert implementation, candidate qualification rules, and route direction policy, see [docs/dex-cex-listing-alert-plan.md](./dex-cex-listing-alert-plan.md).
+
+For the cross-dimension async collection design that bridges discovery qualified candidates into the signal engine, see [docs/alpha-candidate-async-collection.md](./alpha-candidate-async-collection.md).
+
+For the feasibility analysis of listing monitoring sources (DexScreener, Binance, Coinbase, etc.), see [docs/listing-monitor-feasibility.md](./listing-monitor-feasibility.md).
+
 ## Architectural Principle
 
 Separate the system into two planes.

@@ -314,6 +314,10 @@ Wallet signals depend on a governed wallet registry and trade-derived wallet flo
 5. Compute weighted inflow and outflow windows.
 6. Publish wallet score snapshots with registry version and sample diagnostics.
 
+Implementation note:
+
+- wallet score snapshots now preserve `sample_count`, `quality_flag`, `registry_version`, and `freshness_seconds` in the emitted event payload
+
 ### Deliverables
 
 - tracked wallet registry

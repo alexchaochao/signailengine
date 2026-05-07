@@ -20,6 +20,8 @@ from discovery.service import CatalystAlphaSyncService
 from discovery.service import FlowMeasurementSyncService
 from discovery.service import LaunchAlphaSyncService
 from core.pipeline import PipelineWorker
+from core.alpha_collector import AsyncCollectorOrchestrator
+from core.alpha_pipeline import AlphaPipelineWorker
 from infra.alerts import AlertManager
 from infra.logging import configure_logging, get_logger
 from infra.metrics import Metrics, start_metrics_server
@@ -104,6 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flow-measurement-backfill")
     parser.add_argument("--flow-measurement-live", action="store_true")
     parser.add_argument("--telegram-publisher-live", action="store_true")
+    parser.add_argument("--alpha-collector-live", action="store_true")
+    parser.add_argument("--alpha-pipeline-live", action="store_true")
     parser.add_argument("--social-live", action="store_true")
     parser.add_argument("--social-confirmation-live", action="store_true")
     parser.add_argument("--measurement-bridge", action="store_true")
@@ -388,7 +392,7 @@ def run_catalyst_alpha_live_sync(settings: AppSettings) -> int:
         service = CatalystAlphaSyncService(settings, redis_client, repository)
         acquisition_config = AcquisitionConfig.model_validate(settings.acquisition)
         now = datetime.now(UTC)
-        for source in build_catalyst_live_sources(settings):
+        for source in build_catalyst_live_sources(settings, redis_client=redis_client):
             source_name = source.config.source_name or "catalyst_alpha_live"
             state = _load_live_source_state(repository, source_name)
             if state.next_eligible_at is not None and now < state.next_eligible_at:
@@ -447,6 +451,16 @@ def run_catalyst_alpha_live_sync(settings: AppSettings) -> int:
                     snapshot.model_dump(mode="json"),
                     source_name=source.config.source_name or "catalyst_alpha_live",
                 )
+                # Register in SymbolRegistry for cross-source entity dedup
+                if hasattr(snapshot, "token") and hasattr(snapshot, "source_event_id"):
+                    try:
+                        from discovery.catalyst_live_sources import register_catalyst_in_symbol_registry
+                        register_catalyst_in_symbol_registry(snapshot, redis_client=redis_client)
+                    except Exception:
+                        logger.exception(
+                            "catalyst_symbol_registry_failed",
+                            extra={"service": "catalyst_alpha_live", "token": snapshot.token},
+                        )
                 seen_ids.append(snapshot.source_event_id)
             _save_seen_source_event_ids(repository, checkpoint_key, seen_ids)
             _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
@@ -523,6 +537,45 @@ def run_telegram_publisher_live(settings: AppSettings) -> int:
         service = TelegramPublisherService(settings, redis_client, repository, metrics=metrics)
         service.ensure_stream()
         service.process_once(count=100, block_ms=1000)
+    return 0
+
+
+def run_alpha_collector_live(settings: AppSettings) -> int:
+    """Run the async cross-dimension collector once.
+
+    Consumes alpha.candidate_qualified events and publishes
+    alpha.cross_dimension_snapshot events.
+    """
+    redis_client = get_redis_client(settings)
+    with _storage_repository(settings) as (_, repository):
+        metrics = Metrics(settings.observability.service_namespace)
+        orchestrator = AsyncCollectorOrchestrator(settings, redis_client, repository, metrics=metrics)
+        orchestrator.ensure_stream()
+        orchestrator.process_once(count=20, block_ms=1000)
+    return 0
+
+
+def run_alpha_pipeline_live(settings: AppSettings) -> int:
+    """Run the alpha pipeline worker once.
+
+    Consumes alpha.cross_dimension_snapshot events and runs
+    signal → state → route → risk → execution.
+    """
+    redis_client = get_redis_client(settings)
+    with _storage_repository(settings) as (_, repository):
+        metrics = Metrics(settings.observability.service_namespace)
+        alert_manager = AlertManager(metrics, get_logger("signalengine.alpha_pipeline"))
+        engine = get_engine(settings)
+        init_storage(engine)
+        worker = AlphaPipelineWorker(
+            settings,
+            redis_client,
+            db_engine=engine,
+            metrics=metrics,
+            alert_manager=alert_manager,
+        )
+        worker.ensure_streams()
+        worker.poll_once(count=10)
     return 0
 
 
@@ -1054,9 +1107,18 @@ def main() -> int:
         signal.signal(signal.SIGINT, _handle_catalyst_alpha_live_stop_signal)
         signal.signal(signal.SIGTERM, _handle_catalyst_alpha_live_stop_signal)
 
+        # Use the minimum per-source sync interval across enabled sources,
+        # so fast sources (exchangeInfo at 1s) set the polling cadence.
+        _source_intervals = [
+            s.sync_interval_seconds
+            for s in acquisition_config.catalyst_alpha_sources.values()
+            if s.enabled and s.sync_interval_seconds is not None
+        ]
+        _effective_interval = min(_source_intervals) if _source_intervals else acquisition_config.sync_interval_seconds
+
         while not stop_event.is_set():
             run_catalyst_alpha_live_sync(settings)
-            sleep(acquisition_config.sync_interval_seconds)
+            sleep(_effective_interval)
         return 0
 
     if args.flow_measurement_live:
@@ -1133,6 +1195,56 @@ def main() -> int:
 
         while not stop_event.is_set():
             run_telegram_publisher_live(settings)
+            sleep(args.sleep_seconds)
+        return 0
+
+    if args.alpha_collector_live:
+        if args.once:
+            return run_alpha_collector_live(settings)
+
+        stop_event = Event()
+
+        def _handle_alpha_collector_stop_signal(signum: int, frame: object) -> None:
+            _ = frame
+            logger.info(
+                "alpha_collector_stop_requested",
+                extra={
+                    "service": "alpha_collector",
+                    "outcome": f"signal_{signum}",
+                },
+            )
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, _handle_alpha_collector_stop_signal)
+        signal.signal(signal.SIGTERM, _handle_alpha_collector_stop_signal)
+
+        while not stop_event.is_set():
+            run_alpha_collector_live(settings)
+            sleep(args.sleep_seconds)
+        return 0
+
+    if args.alpha_pipeline_live:
+        if args.once:
+            return run_alpha_pipeline_live(settings)
+
+        stop_event = Event()
+
+        def _handle_alpha_pipeline_stop_signal(signum: int, frame: object) -> None:
+            _ = frame
+            logger.info(
+                "alpha_pipeline_stop_requested",
+                extra={
+                    "service": "alpha_pipeline",
+                    "outcome": f"signal_{signum}",
+                },
+            )
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, _handle_alpha_pipeline_stop_signal)
+        signal.signal(signal.SIGTERM, _handle_alpha_pipeline_stop_signal)
+
+        while not stop_event.is_set():
+            run_alpha_pipeline_live(settings)
             sleep(args.sleep_seconds)
         return 0
 

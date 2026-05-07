@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
-
 from datetime import UTC, datetime
+from threading import Event
+
 from typing import cast
 
 from redis import Redis
 from sqlalchemy import create_engine
 
-from core.config import AppSettings
+from core.config import AppSettings, LaunchAlphaLiveSourceConfig
 from core.pipeline import PipelineWorker
 from core.schemas import EventEnvelope, TokenState
+from discovery.live_sources import HttpLaunchSnapshotSource
 
 
 def _load_default_settings(monkeypatch) -> AppSettings:
@@ -86,3 +88,76 @@ def test_pipeline_worker_routes_qualified_launch_candidate_into_dex_entry(monkey
     assert result.route.route == "DEX_ENTRY"
     assert result.risk.allowed is True
     assert result.execution is not None
+
+
+def test_launch_alpha_fetches_pair_details_concurrently(monkeypatch) -> None:
+    settings = _load_default_settings(monkeypatch)
+    created_at_ms = int(datetime.now(UTC).timestamp() * 1000)
+    config = LaunchAlphaLiveSourceConfig(
+        enabled=True,
+        provider="dexscreener_latest_profiles",
+        source_name="launch_alpha_main",
+        chain="solana",
+        source_url="https://example.invalid/seed",
+        pair_detail_url="https://example.invalid/detail",
+        max_seed_records=2,
+        max_snapshot_age_seconds=10_000.0,
+        min_initial_liquidity_usd=0.0,
+        min_buy_notional_5m_usd=0.0,
+        min_trade_count_5m=0,
+        min_unique_wallets_5m=0,
+        min_liquidity_lock_ratio=0.0,
+        max_creator_hold_pct=1.0,
+        dex_allowlist=[],
+        quote_asset_allowlist=["USDC"],
+        token_denylist=[],
+        token_allowlist=[],
+        retry_attempts=1,
+        retry_backoff_seconds=0.0,
+        min_request_interval_seconds=0.0,
+        cache_ttl_seconds=0.0,
+    )
+
+    seed_payload = [
+        {"chainId": "solana", "tokenAddress": "TokenA"},
+        {"chainId": "solana", "tokenAddress": "TokenB"},
+    ]
+    started_details: list[str] = []
+    all_details_started = Event()
+
+    def transport(url: str, timeout_seconds: float):
+        _ = timeout_seconds
+        if url == config.source_url:
+            return seed_payload
+        if url.startswith(config.pair_detail_url):
+            started_details.append(url)
+            if len(started_details) >= 2:
+                all_details_started.set()
+            if not all_details_started.wait(timeout=1.0):
+                raise AssertionError("pair detail requests were not started concurrently")
+            token_address = url.rsplit("/", 1)[-1]
+            pair_address = f"pair-{token_address}"
+            return {
+                "pairs": [
+                    {
+                        "chainId": "solana",
+                        "pairAddress": pair_address,
+                        "dexId": "raydium",
+                        "baseToken": {"address": token_address, "symbol": token_address},
+                        "quoteToken": {"address": "USDC", "symbol": "USDC"},
+                        "liquidity": {"usd": 25000.0},
+                        "volume": {"m5": 12000.0},
+                        "txns": {"m5": {"buys": 12, "sells": 4}},
+                            "pairCreatedAt": created_at_ms,
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected_url:{url}")
+
+    source = HttpLaunchSnapshotSource(settings, config, transport=transport)
+
+    snapshots = source.fetch_snapshots()
+
+    assert len(snapshots) == 2
+    assert sorted(snapshot.token for snapshot in snapshots) == ["TokenA", "TokenB"]
+    assert len(started_details) == 2

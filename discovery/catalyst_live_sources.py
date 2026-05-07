@@ -13,9 +13,25 @@ from typing import Callable
 from urllib.error import URLError
 from urllib import request
 
+from redis import Redis
+
 from core.config import AppSettings, CatalystAlphaLiveSourceConfig
+from discovery.catalyst_common import (
+    _CATALYST_DEDUP_PREFIX,
+    _CATALYST_DEDUP_TTL,
+    _SYMBOL_CACHE_PREFIX,
+    _SYMBOL_CACHE_TTL,
+    _ExchangeSymbol,
+    _headline_for_symbol,
+    _symbol_chain_for_provider,
+)
 from discovery.catalyst_entity_extractor import CatalystEntityExtractor
+from discovery.catalyst_ws_sources import (
+    WS_INSTRUMENT_PROVIDERS,
+    WebSocketInstrumentSource,
+)
 from discovery.schemas import CatalystEventSnapshot
+from discovery.symbol_registry import SymbolRegistry
 
 CatalystHttpTransport = Callable[[str, float], str]
 
@@ -40,9 +56,11 @@ class RssCatalystSnapshotSource:
         config: CatalystAlphaLiveSourceConfig,
         *,
         transport: CatalystHttpTransport | None = None,
+        redis_client: Redis | None = None,
     ) -> None:
         self.settings = settings
         self.config = config
+        self.redis_client = redis_client
         self.entity_extractor = CatalystEntityExtractor(settings, config)
         self.transport = transport or (
             lambda url, timeout_seconds: _http_text_get_transport(
@@ -54,7 +72,10 @@ class RssCatalystSnapshotSource:
         )
 
     def fetch_snapshots(self) -> list[CatalystEventSnapshot]:
-        if self.config.provider not in {"rss_keyword_feed", "binance_cms_api", "coinbase_html_page"}:
+        if self.config.provider not in {
+            "rss_keyword_feed", "binance_cms_api", "coinbase_html_page",
+            "okx_cms_api", "bybit_cms_api",
+        }:
             raise ValueError(f"unsupported_catalyst_alpha_provider:{self.config.provider}")
         payload = self.transport(self.config.source_url, self.config.timeout_seconds)
         entries = _parse_feed_entries(
@@ -65,6 +86,9 @@ class RssCatalystSnapshotSource:
         now = datetime.now(UTC)
         snapshots: list[CatalystEventSnapshot] = []
         for entry in entries[: self.config.max_entries]:
+            # Redis dedup: skip already-processed entries
+            if self.redis_client is not None and self._is_deduplicated(entry.entry_id):
+                continue
             if not self._passes_source_filters(entry, now=now):
                 continue
             for entity in self.entity_extractor.extract(headline=entry.title, summary=entry.summary):
@@ -97,7 +121,18 @@ class RssCatalystSnapshotSource:
                         },
                     )
                 )
+            # Mark entry as processed in Redis
+            if self.redis_client is not None:
+                self._mark_deduplicated(entry.entry_id)
         return snapshots
+
+    def _is_deduplicated(self, entry_id: str) -> bool:
+        key = f"{_CATALYST_DEDUP_PREFIX}{entry_id}"
+        return bool(self.redis_client.exists(key))
+
+    def _mark_deduplicated(self, entry_id: str) -> None:
+        key = f"{_CATALYST_DEDUP_PREFIX}{entry_id}"
+        self.redis_client.setex(key, _CATALYST_DEDUP_TTL, "1")
 
     def _passes_source_filters(self, entry: _FeedEntry, *, now: datetime) -> bool:
         if entry.published_at < now - timedelta(minutes=self.config.max_snapshot_age_minutes):
@@ -112,16 +147,290 @@ class RssCatalystSnapshotSource:
         return True
 
 
-def build_catalyst_live_sources(settings: AppSettings) -> list[RssCatalystSnapshotSource]:
-    sources: list[RssCatalystSnapshotSource] = []
+# ── Symbol-diff based sources ──────────────────────────────────────────
+
+# Provider types that use symbol diff (exchangeInfo polling + WS instruments)
+SYMBOL_DIFF_PROVIDERS = frozenset({
+    "binance_exchange_info",
+    "binance_futures_info",
+    "binance_alpha_api",
+    "coinbase_products_api",
+} | WS_INSTRUMENT_PROVIDERS)
+
+
+class ExchangeInfoCatalystSource:
+    """Detects new symbols/tokens by polling exchangeInfo-style APIs.
+
+    Fetches the current symbol list, diffs against a Redis-cached baseline,
+    and emits CatalystEventSnapshot for any new symbol found.
+    """
+
+    def __init__(
+        self,
+        settings: AppSettings,
+        config: CatalystAlphaLiveSourceConfig,
+        *,
+        transport: CatalystHttpTransport | None = None,
+        redis_client: Redis | None = None,
+    ) -> None:
+        self.settings = settings
+        self.config = config
+        self.redis_client = redis_client
+        self.transport = transport or (
+            lambda url, timeout_seconds: _http_text_get_transport(
+                url,
+                timeout_seconds,
+                retry_attempts=self.config.retry_attempts,
+                retry_backoff_seconds=self.config.retry_backoff_seconds,
+            )
+        )
+
+    def fetch_snapshots(self) -> list[CatalystEventSnapshot]:
+        provider = self.config.provider
+        if provider not in SYMBOL_DIFF_PROVIDERS:
+            raise ValueError(f"unsupported_symbol_diff_provider:{provider}")
+
+        raw = self.transport(self.config.source_url, self.config.timeout_seconds)
+
+        if provider == "binance_exchange_info":
+            current_symbols = _parse_binance_spot_symbols(raw)
+        elif provider == "binance_futures_info":
+            current_symbols = _parse_binance_futures_symbols(raw)
+        elif provider == "binance_alpha_api":
+            current_symbols = _parse_binance_alpha_symbols(raw)
+        elif provider == "coinbase_products_api":
+            current_symbols = _parse_coinbase_products(raw)
+        else:
+            return []
+
+        if not current_symbols:
+            return []
+
+        # Load cached known symbols
+        cache_key = f"{_SYMBOL_CACHE_PREFIX}{self.config.source_name or provider}"
+        known_raw = self.redis_client.get(cache_key) if self.redis_client else None
+        known: set[str] = set()
+        if known_raw:
+            known = set(json.loads(known_raw))
+
+        # Find new symbols
+        new_symbols = [s for s in current_symbols if s.symbol not in known]
+
+        if not new_symbols:
+            return []
+
+        # Update cache
+        all_symbols = known | {s.symbol for s in current_symbols}
+        if self.redis_client:
+            self.redis_client.setex(cache_key, _SYMBOL_CACHE_TTL, json.dumps(list(all_symbols)))
+
+        now = datetime.now(UTC)
+        snapshots: list[CatalystEventSnapshot] = []
+        for sym in new_symbols:
+            chain = _symbol_chain_for_provider(provider)
+            token = sym.base_asset
+            headline = _headline_for_symbol(provider, sym)
+            event_id = f"symbol:{self.config.source_name or provider}:{sym.symbol}:{int(now.timestamp())}"
+
+            # Dedup
+            if self.redis_client is not None:
+                dedup_key = f"{_CATALYST_DEDUP_PREFIX}{event_id}"
+                if self.redis_client.exists(dedup_key):
+                    continue
+                self.redis_client.setex(dedup_key, _CATALYST_DEDUP_TTL, "1")
+
+            snapshots.append(
+                CatalystEventSnapshot(
+                    source_event_id=event_id,
+                    chain=chain,
+                    token=token,
+                    catalyst_type="cex_listing_announcement",
+                    headline=headline,
+                    observed_at=now,
+                    impact_score=self.config.impact_score,
+                    credibility_score=self.config.credibility_score,
+                    lead_time_minutes=0,
+                    venue=self.config.venue,
+                    metadata={
+                        "provider": provider,
+                        "source_url": self.config.source_url,
+                        "source_name": self.config.source_name,
+                        "symbol": sym.symbol,
+                        "contract_type": sym.contract_type,
+                        "status": sym.status,
+                        "quote_asset": sym.quote_asset,
+                    },
+                )
+            )
+        return snapshots
+
+
+def _parse_binance_spot_symbols(raw: str) -> list[_ExchangeSymbol]:
+    """Parse /api/v3/exchangeInfo response."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    symbols = data.get("symbols", [])
+    if not isinstance(symbols, list):
+        return []
+    result: list[_ExchangeSymbol] = []
+    for s in symbols:
+        if not isinstance(s, dict):
+            continue
+        status = str(s.get("status", "")).upper()
+        if status not in {"TRADING", "BREAK"}:
+            continue
+        base = str(s.get("baseAsset", "")).strip()
+        quote = str(s.get("quoteAsset", "")).strip()
+        symbol = str(s.get("symbol", "")).strip()
+        if not base or not symbol:
+            continue
+        # Only TRADING pairs that weren't previously seen
+        if status == "TRADING":
+            result.append(_ExchangeSymbol(
+                symbol=symbol, base_asset=base, quote_asset=quote,
+                status=status, contract_type="spot",
+            ))
+    return result
+
+
+def _parse_binance_futures_symbols(raw: str) -> list[_ExchangeSymbol]:
+    """Parse /fapi/v1/exchangeInfo response (USDT-M futures)."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    symbols = data.get("symbols", [])
+    if not isinstance(symbols, list):
+        return []
+    result: list[_ExchangeSymbol] = []
+    for s in symbols:
+        if not isinstance(s, dict):
+            continue
+        status = str(s.get("status", "")).upper()
+        if status not in {"TRADING", "PENDING"}:
+            continue
+        base = str(s.get("baseAsset", "")).strip()
+        quote = str(s.get("quoteAsset", "")).strip()
+        symbol = str(s.get("symbol", "")).strip()
+        pair = str(s.get("pair", "")).strip()
+        contract_type = str(s.get("contractType", "perpetual")).lower()
+        if not base or not symbol:
+            continue
+        result.append(_ExchangeSymbol(
+            symbol=symbol, base_asset=base, quote_asset=quote,
+            status=status, contract_type=contract_type,
+        ))
+    return result
+
+
+def _parse_binance_alpha_symbols(raw: str) -> list[_ExchangeSymbol]:
+    """Parse Binance Alpha token list API response."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    # Alpha API returns: { "data": [ { "tokenName": "...", "tokenSymbol": "...", "chain": "...", "contractAddress": "..." } ] }
+    items = data.get("data", [])
+    if not isinstance(items, list):
+        return []
+    result: list[_ExchangeSymbol] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("tokenSymbol", "") or item.get("symbol", "")).strip().upper()
+        token_name = str(item.get("tokenName", "") or "").strip()
+        chain = str(item.get("chain", "") or "").strip().lower()
+        if not symbol:
+            continue
+        result.append(_ExchangeSymbol(
+            symbol=symbol,
+            base_asset=symbol,
+            quote_asset="",
+            status="ALPHA",
+            contract_type=f"alpha_{chain}" if chain else "alpha",
+        ))
+    return result
+
+
+def _parse_coinbase_products(raw: str) -> list[_ExchangeSymbol]:
+    """Parse Coinbase /products API response."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    products = data if isinstance(data, list) else data.get("products", data.get("data", []))
+    if not isinstance(products, list):
+        return []
+    result: list[_ExchangeSymbol] = []
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        status = str(p.get("status", "") or p.get("trading_status", "")).upper()
+        if status and status not in {"ONLINE", "TRADING"}:
+            continue
+        product_id = str(p.get("id", "") or p.get("product_id", "") or p.get("product_id", "")).strip()
+        base = str(p.get("base_currency", "") or p.get("baseCurrency", "") or p.get("base", "")).strip()
+        quote = str(p.get("quote_currency", "") or p.get("quoteCurrency", "") or p.get("quote", "")).strip()
+        if not product_id or not base:
+            continue
+        result.append(_ExchangeSymbol(
+            symbol=product_id, base_asset=base, quote_asset=quote,
+            status="TRADING", contract_type="spot",
+        ))
+    return result
+
+
+def build_catalyst_live_sources(
+    settings: AppSettings,
+    *,
+    redis_client: Redis | None = None,
+) -> list[RssCatalystSnapshotSource | ExchangeInfoCatalystSource | WebSocketInstrumentSource]:
+    sources: list[RssCatalystSnapshotSource | ExchangeInfoCatalystSource | WebSocketInstrumentSource] = []
     for source_key, source_config in sorted(settings.acquisition.catalyst_alpha_sources.items()):
         config = source_config.model_copy(
             update={"source_name": source_config.source_name or f"catalyst_alpha_{source_key}"}
         )
         if not config.enabled:
             continue
-        sources.append(RssCatalystSnapshotSource(settings, config))
+        if config.provider in SYMBOL_DIFF_PROVIDERS:
+            if config.provider in WS_INSTRUMENT_PROVIDERS:
+                sources.append(WebSocketInstrumentSource(settings, config, redis_client=redis_client))
+            else:
+                sources.append(ExchangeInfoCatalystSource(settings, config, redis_client=redis_client))
+        else:
+            sources.append(RssCatalystSnapshotSource(settings, config, redis_client=redis_client))
     return sources
+
+
+def register_catalyst_in_symbol_registry(
+    snapshot: CatalystEventSnapshot,
+    *,
+    redis_client: Redis | None = None,
+) -> None:
+    """Register a CatalystEventSnapshot in the SymbolRegistry for cross-source dedup.
+
+    Call this after processing each snapshot to build the canonical token graph.
+    """
+    if redis_client is None:
+        return
+    registry = SymbolRegistry(redis_client)
+    registry.register(
+        snapshot.token,
+        display_name=snapshot.headline.split(":")[-1].strip() if ":" in snapshot.headline else snapshot.token,
+        alias=None,
+        chain=snapshot.chain,
+        source_name=snapshot.metadata.get("source_name", "") or "",
+    )
+    venue = snapshot.venue or snapshot.metadata.get("symbol", "")
+    if venue:
+        registry.register_venue_listing(
+            snapshot.token,
+            venue,
+            status=snapshot.metadata.get("status", "TRADING"),
+            detected_via=snapshot.metadata.get("provider", ""),
+        )
 
 
 def _http_text_get_transport(
@@ -189,6 +498,10 @@ def _parse_feed_entries(
         return _parse_binance_cms_entries(payload, source_name=source_name)
     if provider == "coinbase_html_page":
         return _parse_coinbase_html_entries(payload, source_name=source_name)
+    if provider == "okx_cms_api":
+        return _parse_okx_cms_entries(payload, source_name=source_name)
+    if provider == "bybit_cms_api":
+        return _parse_bybit_cms_entries(payload, source_name=source_name)
     normalized_payload = payload.lstrip()
     if not normalized_payload:
         raise InvalidCatalystFeedError(
@@ -317,6 +630,114 @@ def _parse_coinbase_html_entries(payload: str, *, source_name: str | None = None
             f"invalid_catalyst_feed_payload:{source_name or 'catalyst_alpha'}:no_article_cards"
         )
     return entries
+
+def _parse_okx_cms_entries(payload: str, *, source_name: str | None = None) -> list[_FeedEntry]:
+    """Parse OKX announcement API response.
+
+    API: GET /api/v5/public/announcements?type=2&page=1&pageSize=20
+    Response: {"code":"0","data":[{"announcement":{"title":"...","url":"...","date":"..."}}]}
+    """
+    normalized_payload = payload.lstrip()
+    if not normalized_payload:
+        raise InvalidCatalystFeedError(
+            f"invalid_catalyst_feed_payload:{source_name or 'okx'}:empty_response"
+        )
+    try:
+        document = json.loads(normalized_payload)
+    except json.JSONDecodeError as error:
+        raise InvalidCatalystFeedError(
+            f"invalid_catalyst_feed_payload:{source_name or 'okx'}:json_parse_error"
+        ) from error
+
+    data = document.get("data", [])
+    if not isinstance(data, list):
+        raise InvalidCatalystFeedError(
+            f"invalid_catalyst_feed_payload:{source_name or 'okx'}:invalid_data"
+        )
+
+    entries: list[_FeedEntry] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        ann = item.get("announcement", {})
+        if not isinstance(ann, dict):
+            continue
+        title = str(ann.get("title", "")).strip()
+        url = str(ann.get("url", "")).strip()
+        date_str = str(ann.get("date", "")).strip()
+        if not title or not url:
+            continue
+        entry_id = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+        published_at = datetime.now(UTC)
+        try:
+            published_at = datetime.fromisoformat(date_str.replace("Z", "+00:00")).astimezone(UTC)
+        except (ValueError, TypeError):
+            pass
+        entries.append(
+            _FeedEntry(
+                entry_id=entry_id,
+                title=title,
+                summary="",
+                link=url if url.startswith("http") else f"https://www.okx.com{url}",
+                published_at=published_at,
+            )
+        )
+    return entries
+
+
+def _parse_bybit_cms_entries(payload: str, *, source_name: str | None = None) -> list[_FeedEntry]:
+    """Parse Bybit announcement API response.
+
+    API: /v5/announcements?locale=en-US&page=1&limit=20&type=listing
+    Response: {"result":{"list":[{"title":"...","url":"...","dateTimestamp":"..."}]}}
+    """
+    normalized_payload = payload.lstrip()
+    if not normalized_payload:
+        raise InvalidCatalystFeedError(
+            f"invalid_catalyst_feed_payload:{source_name or 'bybit'}:empty_response"
+        )
+    try:
+        document = json.loads(normalized_payload)
+    except json.JSONDecodeError as error:
+        raise InvalidCatalystFeedError(
+            f"invalid_catalyst_feed_payload:{source_name or 'bybit'}:json_parse_error"
+        ) from error
+
+    result = document.get("result", {})
+    if not isinstance(result, dict):
+        raise InvalidCatalystFeedError(
+            f"invalid_catalyst_feed_payload:{source_name or 'bybit'}:invalid_result"
+        )
+    items = result.get("list", [])
+    if not isinstance(items, list):
+        raise InvalidCatalystFeedError(
+            f"invalid_catalyst_feed_payload:{source_name or 'bybit'}:invalid_list"
+        )
+
+    entries: list[_FeedEntry] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        url = str(item.get("url", "")).strip()
+        ts = item.get("dateTimestamp", 0)
+        if not title or not url:
+            continue
+        entry_id = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+        published_at = datetime.now(UTC)
+        if isinstance(ts, (int, float)) and ts > 0:
+            published_at = datetime.fromtimestamp(ts / 1000.0, tz=UTC)
+        entries.append(
+            _FeedEntry(
+                entry_id=entry_id,
+                title=title,
+                summary="",
+                link=url if url.startswith("http") else f"https://announcements.bybit.com{url}",
+                published_at=published_at,
+            )
+        )
+    return entries
+
 
 def _parse_datetime(value: str | None) -> datetime:
     if not value:

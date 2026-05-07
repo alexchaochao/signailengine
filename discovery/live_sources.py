@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from time import monotonic, sleep
 from typing import Any, Callable
@@ -62,8 +63,8 @@ class HttpLaunchSnapshotSource:
             return self._snapshots_from_records(seed_payload["records"])
         if not isinstance(seed_payload, list):
             raise ValueError("invalid_dexscreener_launch_seed_payload")
-        snapshots: list[LaunchPoolSnapshot] = []
         now = datetime.now(UTC)
+        candidates: list[str] = []
         for record in seed_payload[: self.config.max_seed_records]:
             if not isinstance(record, dict):
                 continue
@@ -72,17 +73,36 @@ class HttpLaunchSnapshotSource:
             token_address = _dexscreener_token_address(record)
             if not token_address:
                 continue
-            detail_url = f"{self.config.pair_detail_url.rstrip('/')}/{parse.quote(token_address)}"
-            detail_payload = self.transport(detail_url, self.config.timeout_seconds)
-            for snapshot in _dexscreener_pair_snapshots(
-                detail_payload,
-                chain=self.config.chain,
-                token_address=token_address,
-            ):
-                if self._passes_filters(snapshot, now=now):
-                    snapshots.append(snapshot)
-                    break
+            candidates.append(token_address)
+
+        if not candidates:
+            return []
+
+        snapshots: list[LaunchPoolSnapshot] = []
+        max_workers = min(len(candidates), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_token_address = {
+                executor.submit(self._fetch_dexscreener_pair_snapshots, token_address): token_address
+                for token_address in candidates
+            }
+            for future in as_completed(future_to_token_address):
+                try:
+                    for snapshot in future.result():
+                        if self._passes_filters(snapshot, now=now):
+                            snapshots.append(snapshot)
+                            break
+                except Exception:
+                    continue
         return snapshots
+
+    def _fetch_dexscreener_pair_snapshots(self, token_address: str) -> list[LaunchPoolSnapshot]:
+        detail_url = f"{self.config.pair_detail_url.rstrip('/')}/{parse.quote(token_address)}"
+        detail_payload = self.transport(detail_url, self.config.timeout_seconds)
+        return _dexscreener_pair_snapshots(
+            detail_payload,
+            chain=self.config.chain,
+            token_address=token_address,
+        )
 
     def _fetch_json_with_fallback(self, urls: list[str]) -> dict[str, Any] | list[dict[str, Any]]:
         last_error: Exception | None = None

@@ -35,6 +35,11 @@ This document defines the minimum policy surface that the Phase 1 and later risk
 - max daily loss: 0.03
 - default cooldown after exit: 30 minutes
 
+Implementation note:
+
+- buy intents that size to zero or below are rejected before execution
+- buy intents for a token still inside the post-exit cooldown are rejected with an explicit `cooldown_active` violation
+
 ---
 
 ## Trade Admission Requirements

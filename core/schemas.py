@@ -315,6 +315,52 @@ class FeatureQualityRecord(BaseModel):
     created_at: datetime | None = None
 
 
+class CrossDimensionSnapshot(BaseModel):
+    """Unified cross-dimension data snapshot triggered by alpha candidate qualification.
+
+    Contains on-chain, wallet, and social data for a single token,
+    collected asynchronously after an alpha.candidate_qualified event.
+    """
+    schema_version: str = Field(default=SCHEMA_VERSION)
+    snapshot_id: str
+    alpha_type: str
+    chain: str
+    token: str
+
+    # Trigger source info (from the original alpha.candidate_qualified)
+    trigger_source: str
+    trigger_score: float = 0.0
+    trigger_reasons: list[str] = Field(default_factory=list)
+
+    # On-chain snapshot
+    onchain_liquidity_usd: float | None = None
+    onchain_volume_5m_usd: float | None = None
+    onchain_price_usd: float | None = None
+    onchain_price_change_5m: float | None = None
+    onchain_price_change_1h: float | None = None
+    onchain_fdv: float | None = None
+    onchain_pool_count: int = 0
+
+    # Wallet snapshot
+    wallet_smart_money_inflow_usd: float | None = None
+    wallet_smart_money_outflow_usd: float | None = None
+    wallet_unique_buyers: int | None = None
+    wallet_unique_sellers: int | None = None
+    wallet_whale_buys: int = 0
+
+    # Social snapshot
+    social_sentiment: float | None = None
+    social_velocity: float | None = None
+    social_mention_count: int = 0
+    social_unique_authors: int = 0
+
+    # Collection metadata
+    collected_chains: list[str] = Field(default_factory=list)
+    timed_out: bool = False
+    collection_latency_ms: int = 0
+    errors: dict[str, str] = Field(default_factory=dict)
+
+
 class DexTradeFact(BaseModel):
     trade_id: str
     chain: str

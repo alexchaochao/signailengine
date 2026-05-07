@@ -227,8 +227,12 @@ acquisition:
 
   # Launch Alpha：新池子/新对的发现链。
   launch_alpha_sources:
+    # Solana 新池检测
+    # ⚠ DexScreener Latest Profiles 容易被垃圾池污染，
+    #    rug_filter 参数在代码层预留但 DexScreener 本身不提供这些字段。
+    #   真正的 rug 防护需要额外数据源（如 RugCheck XYZ API 或 BPF 合约分析）。
     solana_new_pools:
-      enabled: false
+      enabled: true
       provider: dexscreener_latest_profiles
       source_name: launch_alpha_solana
       chain: solana
@@ -252,8 +256,14 @@ acquisition:
       min_unique_wallets_5m: 8
       min_liquidity_lock_ratio: 0.85
       max_creator_hold_pct: 0.15
+      # Rug filter（代码层已预留字段，DexScreener 本身不提供）
+      min_deployer_age_days: 30
+      require_honeypot_sim: true
+      require_mint_revoked: true
+      require_creator_lp_transfer: true
+    # Base 新池检测
     base_new_pools:
-      enabled: false
+      enabled: true
       provider: dexscreener_latest_profiles
       source_name: launch_alpha_base
       chain: base
@@ -277,19 +287,35 @@ acquisition:
       min_unique_wallets_5m: 10
       min_liquidity_lock_ratio: 0.85
       max_creator_hold_pct: 0.15
+      # Rug filter
+      min_deployer_age_days: 30
+      require_honeypot_sim: true
+      require_mint_revoked: true
+      require_creator_lp_transfer: true
 
-  # Catalyst Alpha：公告 / RSS 类催化信息。
+  # Catalyst Alpha：公告 / RSS 类催化信息 + exchangeInfo 新币检测。
+  #
+  # 信号优先级（最快 → 最慢）：
+  #   Tier 1 (WS / 0.5-1s) : Binance Announcement WS, OKX instruments WS, Bybit instruments WS
+  #   Tier 2 (poll / 1-2s)  : exchangeInfo diff, Coinbase products API, Binance Alpha API
+  #   Tier 3 (poll / 30s)   : Binance CMS, Coinbase blog (仅 confirmation，非 primary alpha)
+  #   Tier 4 (future)       : Upbit, Hyperliquid, Jupiter Strict List
+  #
+  # 🚨 公告类源（CMS/Blog）应仅作为 confirmation/backup！
+  #    真正的低延迟 alpha 来自 WS + symbol state diff。
   catalyst_alpha_sources:
+    # ── 速度 Tier 2-3：公告类（confirmation only）─────────────────
     binance_listings:
       enabled: true
       provider: binance_cms_api
       source_name: catalyst_alpha_binance
       source_url: https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=20
-      timeout_seconds: 5.0
+      sync_interval_seconds: 45.0
+      timeout_seconds: 60.0
       retry_attempts: 3
       retry_backoff_seconds: 0.75
       max_entries: 20
-      max_snapshot_age_minutes: 720
+      max_snapshot_age_minutes: 20160
       required_keywords: [list, listing, roadmap, launch]
       excluded_keywords: [delist, removal, maintenance, suspend]
       venue: binance
@@ -297,16 +323,18 @@ acquisition:
       impact_score: 0.88
       credibility_score: 0.92
       extraction_mode: llm_with_heuristic_fallback
+      dedup_enabled: true
     coinbase_blog:
       enabled: true
       provider: coinbase_html_page
       source_name: catalyst_alpha_coinbase
       source_url: https://www.coinbase.com/blog
-      timeout_seconds: 5.0
+      sync_interval_seconds: 60.0
+      timeout_seconds: 60.0
       retry_attempts: 3
       retry_backoff_seconds: 0.75
       max_entries: 20
-      max_snapshot_age_minutes: 720
+      max_snapshot_age_minutes: 20160
       required_keywords: [list, listing, roadmap, asset]
       excluded_keywords: [delist, removal, maintenance, suspend]
       venue: coinbase
@@ -314,6 +342,171 @@ acquisition:
       impact_score: 0.8
       credibility_score: 0.88
       extraction_mode: llm_with_heuristic_fallback
+      dedup_enabled: true
+    # ❌ OKX 公告 API 当前返回 404（URL 已变更或需认证）
+    # ✅ 替代方案：OKX instruments WebSocket (wss://ws.okx.com:8443/ws/v5/public)
+    #    监听频道: instruments (SPOT, SWAP)
+    #    当新交易对出现时，WS 推送速度远快于 REST 公告 API
+    okx_instruments_ws:
+      enabled: true
+      provider: okx_instruments_ws
+      source_name: catalyst_okx_ws
+      sync_interval_seconds: 3.0
+      timeout_seconds: 60.0
+      retry_attempts: 3
+      retry_backoff_seconds: 1.0
+      max_entries: 0
+      max_snapshot_age_minutes: 0
+      venue: okx
+      default_chain: okx
+      impact_score: 0.85
+      credibility_score: 0.85
+      extraction_mode: heuristic
+      dedup_enabled: true
+    okx_listings:
+      enabled: false
+      provider: okx_cms_api
+      source_name: catalyst_alpha_okx
+      source_url: https://www.okx.com/api/v5/public/announcements?type=2&page=1&pageSize=20
+      sync_interval_seconds: 60.0
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.75
+      max_entries: 20
+      max_snapshot_age_minutes: 20160
+      required_keywords: [list, listing, launch]
+      excluded_keywords: [delist, removal, maintenance, suspend]
+      venue: okx
+      default_chain: unknown
+      impact_score: 0.82
+      credibility_score: 0.85
+      extraction_mode: llm_with_heuristic_fallback
+      dedup_enabled: true
+    # ❌ Bybit 公告 API 当前返回 403（需要 API key 认证）
+    # ✅ 替代方案：Bybit instruments-info WebSocket
+    #    (wss://stream.bybit.com/v5/public/spot)
+    #    监听: public.instruments.info
+    #    当新交易对出现时，WS 推送变化
+    bybit_instruments_ws:
+      enabled: true
+      provider: bybit_instruments_ws
+      source_name: catalyst_bybit_ws
+      sync_interval_seconds: 3.0
+      timeout_seconds: 60.0
+      retry_attempts: 3
+      retry_backoff_seconds: 1.0
+      max_entries: 0
+      max_snapshot_age_minutes: 0
+      venue: bybit
+      default_chain: bybit
+      impact_score: 0.85
+      credibility_score: 0.85
+      extraction_mode: heuristic
+      dedup_enabled: true
+    bybit_listings:
+      enabled: false
+      provider: bybit_cms_api
+      source_name: catalyst_alpha_bybit
+      source_url: https://api.bybit.com/v5/announcements?locale=en-US&page=1&limit=20&type=listing
+      sync_interval_seconds: 60.0
+      timeout_seconds: 5.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.75
+      max_entries: 20
+      max_snapshot_age_minutes: 20160
+      required_keywords: [list, listing, launch]
+      excluded_keywords: [delist, removal, maintenance, suspend]
+      venue: bybit
+      default_chain: unknown
+      impact_score: 0.82
+      credibility_score: 0.85
+      extraction_mode: llm_with_heuristic_fallback
+      dedup_enabled: true
+
+    # ── 速度 Tier 1-2：exchangeInfo 新币检测源（最快信号）─────────
+    binance_exchange_info:
+      enabled: true
+      provider: binance_exchange_info
+      source_name: catalyst_binance_spot
+      source_url: https://api.binance.com/api/v3/exchangeInfo
+      # ⚡ 1s 轮询 + Redis symbol diff
+      sync_interval_seconds: 1.0
+      timeout_seconds: 120.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.5
+      max_entries: 0
+      max_snapshot_age_minutes: 0
+      venue: binance
+      default_chain: binance_spot
+      impact_score: 0.9
+      credibility_score: 0.95
+      extraction_mode: heuristic
+      dedup_enabled: true
+    binance_futures_info:
+      enabled: true
+      provider: binance_futures_info
+      source_name: catalyst_binance_futures
+      source_url: https://fapi.binance.com/fapi/v1/exchangeInfo
+      sync_interval_seconds: 1.0
+      timeout_seconds: 120.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.5
+      max_entries: 0
+      max_snapshot_age_minutes: 0
+      venue: binance
+      default_chain: binance_futures
+      impact_score: 0.95
+      credibility_score: 0.95
+      extraction_mode: heuristic
+      dedup_enabled: true
+    binance_alpha_api:
+      enabled: true
+      provider: binance_alpha_api
+      source_name: catalyst_binance_alpha
+      source_url: https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list
+      # ⚡ 1s 轮询 — 上线前 alpha 信号
+      sync_interval_seconds: 2.0
+      timeout_seconds: 120.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.5
+      max_entries: 0
+      max_snapshot_age_minutes: 0
+      venue: binance
+      default_chain: binance_alpha
+      impact_score: 0.92
+      credibility_score: 0.9
+      extraction_mode: heuristic
+      dedup_enabled: true
+    coinbase_products_api:
+      enabled: true
+      provider: coinbase_products_api
+      source_name: catalyst_coinbase_products
+      source_url: https://api.exchange.coinbase.com/products
+      sync_interval_seconds: 2.0
+      timeout_seconds: 120.0
+      retry_attempts: 3
+      retry_backoff_seconds: 0.5
+      max_entries: 0
+      max_snapshot_age_minutes: 0
+      venue: coinbase
+      default_chain: coinbase
+      impact_score: 0.85
+      credibility_score: 0.9
+      extraction_mode: heuristic
+      dedup_enabled: true
+
+    # ⬇ P0: Binance Announcement WebSocket（待实现）
+    #   监听 https://www.binance.com/ 的公告推送，比 exchangeInfo 快 2-15s
+    #   实现方案: wss://ws-api.binance.com/ws/ 或 announcement page polling with diff
+    #
+    # ⬇ P1: Coinbase Asset Roadmap（待实现）
+    #   API: https://api.exchange.coinbase.com/asset/roadmap
+    #   比 blog 抓取更快更结构化
+    #
+    # ⬇ P1: Hyperliquid / Upbit / Jupiter Strict List（待实现）
+    #   - Hyperliquid: wss://api.hyperliquid.xyz/ws (listener: "webData2")
+    #   - Upbit: https://api.upbit.com/v1/market/all
+    #   - Jupiter Strict List: https://tokens.jup.ag/strict
 
           # Flow Alpha：token-bound 钱包流默认只做 confirmation / measurement，不作为 discovery 入口。
   flow_alpha_sources:
