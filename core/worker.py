@@ -386,6 +386,9 @@ def run_flow_measurement_backfill(
 
 
 def run_catalyst_alpha_live_sync(settings: AppSettings) -> int:
+    import sys as _sys
+    _sys.stderr.write(f"DEBUG: run_catalyst_alpha_live_sync STARTED at {datetime.now(UTC)}\n")
+    _sys.stderr.flush()
     logger = get_logger("signalengine.catalyst_alpha_live")
     redis_client = get_redis_client(settings)
     with _storage_repository(settings) as (_, repository):
@@ -462,6 +465,10 @@ def run_catalyst_alpha_live_sync(settings: AppSettings) -> int:
                             extra={"service": "catalyst_alpha_live", "token": snapshot.token},
                         )
                 seen_ids.append(snapshot.source_event_id)
+            _save_seen_source_event_ids(repository, checkpoint_key, seen_ids)
+            _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
+            _sys.stderr.write(f"DEBUG: {source_name} done, snapshots={len(snapshots)}, qualified={len([s for s in snapshots if s.source_event_id not in seen_ids])}, seen_ids_len={len(seen_ids)}\n")
+            _sys.stderr.flush()
             _save_seen_source_event_ids(repository, checkpoint_key, seen_ids)
             _save_live_source_state(repository, source_name, consecutive_failures=0, next_eligible_at=None)
     return 0
