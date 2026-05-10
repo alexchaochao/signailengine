@@ -16,14 +16,16 @@ print()
 # 1. min_score
 print("--- 1. Telegram min_score 实际加载值 ---")
 try:
-    # Load .env
+    # Load .env — handle values with = signs and quotes
     with open("/opt/signalengine/.env") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            k, _, v = line.partition("=")
-            os.environ[k.strip()] = v.strip().strip("'\"")
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip("'\""")
+            os.environ[key] = val
 
     from core.config import AppSettings
     s = AppSettings()

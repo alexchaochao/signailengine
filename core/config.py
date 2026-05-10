@@ -312,6 +312,8 @@ class MomentumAlphaLiveSourceConfig(BaseModel):
     sync_interval_seconds: float | None = None
     max_seed_records: int = 30
     max_snapshot_age_seconds: float = 300.0
+    cache_ttl_seconds: float = 15.0
+    min_request_interval_seconds: float = 0.25
     # Momentum thresholds
     min_volume_5m_usd: float = 15_000.0
     min_price_change_1h_pct: float = 10.0
