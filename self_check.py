@@ -4,9 +4,9 @@
 """
 import os, subprocess, sys
 
-sys.path.insert(0, "/opt/signalengine")
-os.chdir("/opt/signalengine")
+# Let AppSettings.load() handle .env + env vars directly
 os.environ.setdefault("SIGNALENGINE_RUNTIME__ENVIRONMENT", "production")
+os.chdir("/opt/signalengine")
 
 print("=" * 60)
 print("  signalengine 线上自检")
@@ -28,7 +28,7 @@ try:
             os.environ[key] = val
 
     from core.config import AppSettings
-    s = AppSettings()
+    s = AppSettings.load()
     t = s.notifications.telegram
     print(f"  enabled={t.enabled}")
     print(f"  bot_token={'***' if t.bot_token else '(empty)'}")
