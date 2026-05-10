@@ -28,6 +28,9 @@ POSTGRES_USER="signalengine"
 POSTGRES_PASSWORD="${SIGNALENGINE_DB_PASSWORD:-signalengine}"  # 建议通过环境变量传入
 REDIS_PORT=6379
 
+# 可选跳过 PostgreSQL（如果服务器已有）
+SKIP_POSTGRES="${SKIP_POSTGRES:-0}"
+
 # Python 版本
 PYTHON_VERSION="3.12"
 PIP_REQUIREMENTS="requirements.txt"
@@ -148,20 +151,25 @@ sleep 1
 redis-cli ping || warn "Redis 未响应，请手动检查"
 
 # ── 步骤 6: 配置 PostgreSQL ──────────────────────────────────────────────
-info "[6/8] 配置 PostgreSQL..."
+if [[ "$SKIP_POSTGRES" -eq 1 ]]; then
+    info "[6/8] 跳过 PostgreSQL（SKIP_POSTGRES=1）..."
+    info "  确保 .env 中 SIGNALENGINE_POSTGRES__URL 指向你的现有数据库"
+else
+    info "[6/8] 配置 PostgreSQL..."
 
-systemctl enable postgresql
-systemctl restart postgresql
-sleep 2
+    systemctl enable postgresql
+    systemctl restart postgresql
+    sleep 2
 
-# 创建数据库和用户（幂等）
-sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$POSTGRES_USER'" | grep -q 1 \
-    || sudo -u postgres psql -c "CREATE ROLE $POSTGRES_USER LOGIN PASSWORD '$POSTGRES_PASSWORD';"
-sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='$POSTGRES_DB'" | grep -q 1 \
-    || sudo -u postgres psql -c "CREATE DATABASE $POSTGRES_DB OWNER $POSTGRES_USER;"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $POSTGRES_DB TO $POSTGRES_USER;"
+    # 创建数据库和用户（幂等）
+    sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$POSTGRES_USER'" | grep -q 1 \
+        || sudo -u postgres psql -c "CREATE ROLE $POSTGRES_USER LOGIN PASSWORD '$POSTGRES_PASSWORD';"
+    sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='$POSTGRES_DB'" | grep -q 1 \
+        || sudo -u postgres psql -c "CREATE DATABASE $POSTGRES_DB OWNER $POSTGRES_USER;"
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $POSTGRES_DB TO $POSTGRES_USER;"
 
-info "数据库 $POSTGRES_DB 就绪"
+    info "数据库 $POSTGRES_DB 就绪"
+fi
 
 # ── 步骤 7: 生成 .env 配置文件 ────────────────────────────────────────────
 info "[7/8] 生成 .env 配置..."

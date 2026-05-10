@@ -1,13 +1,45 @@
 # DEX/CEX Listing Alert Plan
 
-## Purpose
+## ⚠️ 设计纠偏（2026-05-09）
 
-This document turns the current alpha discovery stack into a practical
-listing-alert system for both DEX and CEX venues.
+**CEX 上币监听不是 alpha 源，而是 token 生命周期阶段信号。**
 
-The system is designed to detect early listing signals, qualify them into
-structured alpha candidates, and then hand them off to the existing
-signal/state/router/risk/execution pipeline.
+这段历史文档最初将 CEX 上币检测视为"发现新机会的手段"，但经过生产验证后发现：
+
+| 原假设 | 实际结论 |
+|--------|---------|
+| CEX 上币 = 新交易机会 | ❌ Coinbase/Binance 每天上大量币，大部分不是交易机会 |
+| 公告越早上车越好 | ❌ 真正 alpha 在上币之前就已出现（链上早期发现） |
+| 上币通知越多越好 | ❌ 99% 是噪音，1% 才是信号 |
+
+**正确的设计定位**：
+
+```
+CEX 上币检测 → 不是产生 alpha，而是更新 token 的"生命周期阶段"
+  → 告诉 routing 层："这个 token 现在有 CEX venue 了"
+  → 路由决策变化：优先走 CEX 而非 DEX
+  → 影响执行参数：slippage / 滑点 / 费用优化
+```
+
+**实时 alpha 的真正来源**：
+
+```
+链上聪明钱流动（Smart Money Flow）
+  ↓
+成交量爆发/价格动量（Volume Momentum）
+  ↓
+新池早期发现（New Pool Discovery）
+  ↓
+【以上三项才是真正的 alpha 来源——CEX 上币只是阶段确认】
+```
+
+## Purpose（修订后）
+
+This document defines:
+
+1. **Token Lifecycle Stage Detection** — 通过 exchangeInfo diff / instruments API 检测 token 在各 CEX 的上线状态，用于路由决策，**不是用于 alpha 挖掘**
+2. **Real Alpha Sources** — 基于链上数据的 alpha 发现策略（聪明钱、成交量爆发、新池早期发现）
+3. **Route Decision Mapping** — 不同生命周期阶段对应不同的路由和执行策略
 
 ## What the system does today
 
@@ -66,24 +98,28 @@ Current event payload includes:
 - pool metadata
 - launch-derived features such as buy pressure and wallet inflow score
 
-### 2. Catalyst Alpha
+### 2. Catalyst Alpha → 重定义为「Token Lifecycle Instance」
 
-Source family:
+**⚠️ 设计纠偏：以下内容已从"alpha 源"重定义为"token 生命周期阶段检测"。**
+
+不再视为 alpha 候选，而是 TokenStage 的输入信号——当 CEX 上币被检测到，更新 SymbolRegistry 中的 `venue_lifecycle` 记录，路由层据此调整执行策略。
+
+Source family（保留，但用途改变）：
 
 **信号优先级（最快 → 最慢）：**
 
-| Tier | 速度 | 类型 | 源 | 状态 |
+| Tier | 速度 | 类型 | 源 | 用途 |
 |------|------|------|-----|------|
-| 1 | WS / 实时 | WebSocket 推送 | Binance Announcement WS（不存在的公开 API）, OKX/Bybit instruments WS | ❌ 待异步架构 |
-| 2 | poll / 1-3s | REST symbol diff | Binance Spot/Futures exchangeInfo, Coinbase products, Binance Alpha, **OKX instruments**, **Bybit instruments** | ✅ 全部运行中 |
-| 3 | poll / 45-60s | CMS 公告 | Binance CMS feed, Coinbase blog | ✅ 仅作 confirmation |
+| 1 | WS / 实时 | WebSocket | OKX/Bybit instruments WS | ❌ 待异步架构 |
+| 2 | poll / 1-3s | REST symbol diff | Binance Spot/Futures exchangeInfo, Coinbase products, Binance Alpha, OKX/Bybit instruments | ✅ 用于 lifecycle 检测 |
+| 3 | poll / 45-60s | CMS 公告 | Binance CMS feed, Coinbase blog | ✅ 备选/backup |
 
 关键变化：
-- OKX: 放弃 CMS API（404），改用 `GET /api/v5/public/instruments?instType=SPOT` REST 轮询
-- Bybit: 放弃 CMS API（403），改用 `GET /v5/market/instruments-info?category=spot` REST 轮询
-- OKX/Bybit WS 代码已就绪（`discovery/catalyst_ws_sources.py`），待异步架构启用
+- OKX: 放弃 CMS API（404），改用 REST instruments API
+- Bybit: 放弃 CMS API（403），改用 REST instruments API
+- OKX/Bybit WS 代码已就绪，待异步架构
 
-**exchangeInfo / instruments 新币检测** ✅（Tier 2，当前最快信号）:
+**exchangeInfo / instruments 检测** ✅:
   - `binance_exchange_info` — poll `/api/v3/exchangeInfo` @ 1s
   - `binance_futures_info` — poll `/fapi/v1/exchangeInfo` @ 1s
   - `binance_alpha_api` — poll Binance Alpha Token List @ 2s
@@ -119,10 +155,7 @@ Current event payload includes:
 
 ### 3. Flow Alpha
 
-Source family:
-
-- wallet intelligence
-- flow measurement / projected wallet flows
+Source family: wallet intelligence — OKX registry + wallet refresh + wallet flow projection
 
 Qualification rules:
 
@@ -133,74 +166,126 @@ Qualification rules:
 Current event payload includes:
 
 - `alpha_type = FLOW`
-- flow windows
 - wallet inflow / outflow measures
 - candidate metadata
 
-## Current route behavior
+---
 
-The router is currently long-biased for entry.
+## 4. 真实 Alpha 策略（2026-05-09 设计纠偏）
 
-### Entry routes
+### 核心设计原则
 
-- `PRE_LAUNCH`, `EARLY_LIQUIDITY`, `NARRATIVE_EXPLOSION` -> `DEX_ENTRY`
-- `CEX_LISTING` -> `CEX_ENTRY`
+```
+CEX 上币检测 ≠ alpha 源
+CEX 上币检测 = token 生命周期阶段信号 → 路由决策
 
-Both of those entry routes use `ActionType.BUY` today.
+链上数据 = 真正的 alpha 源
+  ├─ 聪明钱流入（Smart Money Flow）
+  ├─ 成交量爆发（Volume Momentum）
+  └─ 新池早期发现（New Pool Launch）
+```
 
-### Exit route
+CEX 上币阶段信号的用途（而不是作为 alpha 触发交易）：
 
-- `DISTRIBUTION` with an open position -> `DEX_EXIT` or `CEX_EXIT`
-- the action is `ActionType.EXIT`
+| 检测到的情况 | 路由影响 |
+|------------|---------|
+| Token 首次出现在 Binance Spot | → 该 token 有 CEX venue 了，路由优先走 CEX |
+| Token 出现在 Binance Futures | → 可做合约交易，考虑对冲/套利 |
+| Token 首次出现在 Coinbase | → 美国流动性确认，扩大路由范围 |
+| Token 出现在 Binance Alpha | → 可能即将现货上线，预热阶段 |
 
-### Not implemented yet
+### 🅰 Smart Money Inflow Detection（P0，最高价值）
 
-- explicit `SELL` route
-- explicit `SHORT` route
-- separate route selection by `alpha_type`
+**原理**：当一个新池被 launch-alpha 发现时，检查 OKX registry 中的已知聪明钱包是否在买入该 token。
 
-The current system infers direction from the state machine and route:
+**依托的现有能力**：
+- ✅ OKX wallet registry — 已有聪明钱包列表
+- ✅ DexScreener new pool — 新池发现
+- ✅ Wallet flow projection — 可按 token 投影流量
+- ✅ SymbolRegistry — 跨源 token 关联
 
-- entry states mean buy / long
-- distribution means exit
+**核心逻辑**：
+```
+launch-alpha 发现新池
+  → 从 OKX registry 加载活跃聪明钱包
+  → 检查这些钱包是否有买入该 token 的记录
+  → 买入的聪明钱包数量 N → 信号强度
+  → N ≥ threshold → alpha.smart_money_flow 事件
+  → 路由层据此决定执行
+```
 
-## Direct answer to "if listing is observed, does it trigger on-chain action?"
+**开发成本**：~2 天（串联现有模块 + 评分函数）
 
-No, not by itself.
+### 🅱 Volume Momentum Detection（P0）
 
-A listing keyword or listing announcement only becomes actionable after:
+**原理**：持续监控已知 token 的成交量和价格变化，发现爆发式增长。
 
-1. the source extracts a candidate
-2. the candidate is qualified
-3. the signal engine assigns a state
-4. the router decides entry or exit
-5. risk allows the intent
+**依托的现有能力**：
+- ✅ DexScreener pair detail API（已用於 launch-alpha）
+- ✅ SymbolRegistry 已知 token 列表
+- ✅ Cross-dimension collector 的 on-chain 采集
 
-So the current system does not do "keyword -> trade".
-It does "candidate -> signal -> route -> trade".
+**核心逻辑**：
+```
+新服务 momentum-alpha
+  ├─ 轮询 DexScreener Token-Boosts API
+  │   → 社区投票 + 成交量爆发 = 高质量信号
+  ├─ 或扫描已有 token 的 pair detail
+  │   → volume_5m > 前值 × 5
+  │   → price_change_1h > 20%
+  │   → unique_wallets 增长 > 300%
+  └─ 达标后 → alpha.candidate_qualified
+```
 
-## Direction policy for the current stack
+**开发成本**：~3 天
 
-For the current implementation, the safe default is:
+### 🅲 Cross-Chain Expansion Detection（P1）
 
-- launch / catalyst / flow alpha: treat as buy / long candidates
-- distribution: treat as exit candidates
-- do not infer shorting unless a dedicated short strategy exists
+**原理**：token 从 Solana → Base → Ethereum 的跨链迁移，通常是 CEX 上线的预备动作。
 
-This matches the codebase today:
+**依托**：SymbolRegistry + DexScreener Search API
 
-- `ActionType.BUY` is used for entry routes
-- `ActionType.EXIT` is used for distribution exits
-- `ActionType.SELL` exists in schemas but is not currently emitted by the router
+## 完整数据流
 
-## Operational recommendation
+```
+Real Alpha Sources（产生交易信号）
+┌──────────────────────────┐
+│ 🅰 Smart Money Inflow   │
+│ 🅱 Volume Momentum      │
+│ 🅲 Cross-Chain Expansion│
+│ 🅳 New Pool Launch      │
+└──────────────────────────┘
+           ↓
+    alpha.candidate_qualified
+    → signal / state / route
+    → risk → execution
 
-To keep notifications useful and avoid premature trades:
+Stage Signals（用于路由决策）
+┌──────────────────────────┐
+│ CEX Listing Detected    │
+│ (exchangeInfo / instr.) │
+└──────────────────────────┘
+           ↓
+    SymbolRegistry.venue_lifecycle
+    → 路由层调整执行策略
+      ├─ DEX entry → CEX entry
+      ├─ 调整滑点/费用参数
+      └─ Telegram 通知（可选）
+```
 
-1. Notify on `alpha.candidate_qualified`.
-2. Include route-relevant fields in the notification body.
-3. Keep automatic trading disabled until direction rules are explicit.
-4. Add a separate short strategy only after the repo supports a real reverse-direction route.
+## 方向策略
+
+对于当前实现的 safe default：
+
+- Smart Money Inflow / Volume Momentum / New Pool → 做多候选
+- Distribution / 异常流出 → 退出候选
+- 不做空，除非有专门的做空策略
+
+## 运营建议
+
+1. **关掉/大幅收紧** catalyst-alpha 的 Telegram 通知（`min_score=0.98` 以上）
+2. **链上 alpha 通知门槛**适当降低（`min_score=0.75`）
+3. 保持 `live_trading_enabled=false`，直到路线明确
 
 ## Gaps still open
 

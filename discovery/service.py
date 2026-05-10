@@ -15,6 +15,7 @@ from core.schemas import EventEnvelope, RawEventRecord
 from discovery.catalyst_scanner import CatalystAlphaScanner
 from discovery.flow_scanner import FlowAlphaScanner
 from discovery.pool_scanner import LaunchAlphaScanner, LaunchAlphaThresholds
+from discovery.smart_money_detector import SmartMoneyDetector, SmartMoneyInflowResult
 from discovery.schemas import (
     AlphaCandidate,
     AlphaCandidateEvent,
@@ -182,6 +183,14 @@ class LaunchAlphaSyncService:
             previous_candidate=previous_candidate,
             candidate=candidate,
         )
+        # Smart Money Inflow: only for newly QUALIFIED launch candidates
+        if candidate.alpha_type == AlphaType.LAUNCH and candidate.status == AlphaCandidateStatus.QUALIFIED:
+            _check_smart_money_inflow(
+                self.redis_client,
+                self.settings,
+                self.repository,
+                candidate=candidate,
+            )
         self.logger.info(
             "launch_alpha_sync_result",
             extra={
@@ -675,6 +684,45 @@ def _publish_qualified_candidate_event(
         },
     )
     return publish_raw_events(redis_client, settings, event)[0]
+
+
+def _check_smart_money_inflow(
+    redis_client: Redis,
+    settings: AppSettings,
+    repository: StorageRepository,
+    *,
+    candidate: AlphaCandidate,
+) -> SmartMoneyInflowResult | None:
+    """Run smart money inflow check after a LAUNCH candidate is qualified.
+
+    Only runs when:
+    - The candidate is LAUNCH type
+    - The wallet registry has entries for this chain
+    """
+    if candidate.alpha_type != AlphaType.LAUNCH:
+        return None
+    try:
+        detector = SmartMoneyDetector(settings, redis_client, repository)
+        result = detector.check_token(candidate.chain, candidate.token)
+        if result.has_smart_money:
+            logger = logging.getLogger("signalengine.smart_money_check")
+            logger.info(
+                "smart_money_inflow_detected",
+                extra={
+                    "token": candidate.token,
+                    "chain": candidate.chain,
+                    "smart_buyers": result.smart_wallet_buyers,
+                    "confidence": result.confidence_score,
+                },
+            )
+        return result
+    except Exception:
+        logger = logging.getLogger("signalengine.smart_money_check")
+        logger.exception(
+            "smart_money_check_failed",
+            extra={"token": candidate.token, "chain": candidate.chain},
+        )
+        return None
 
 
 def _flow_wallet_inflow_score(snapshot: FlowActivitySnapshot) -> float:

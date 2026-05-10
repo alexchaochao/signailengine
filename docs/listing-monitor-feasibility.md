@@ -226,12 +226,36 @@ Phase 5 — 架构升级（2026-05-07 进度）
 
 ---
 
-## 7. 风险汇总
+## 7. ⚠️ 设计纠偏（2026-05-09）
 
-| 风险 | 概率 | 影响 | 缓解措施 |
-|------|------|------|---------|
-| CEX 公告 API 变更 | 中 | 高 | 多个 CEX 源互备 |
-| DexScreener 限流 | 低 | 中 | 配置扫描间隔 / 代理 |
-| 免费 API 停止服务 | 低 | 高 | 预留付费 API 升级路径 |
-| token 合约地址跨链不一致 | 高 | 中 | 使用 DexScreener token search 做地址解析 |
-| 误报导致无效通知 | 中 | 低 | 评分阈值可配 + 人工确认机制 |
+### 7.1 CEX 上币监听不是 alpha 源
+
+经过生产验证后，确认以下结论：
+
+**CEX 上币监听不是产生交易信号的 alpha 源。**
+**它是 token 生命周期阶段信号，用于路由决策。**
+
+### 7.2 真正的 alpha 来源优先级
+
+| 优先级 | 来源 | 说明 | 状态 |
+|--------|------|------|------|
+| 🅰 P0 | **Smart Money Inflow** | 聪明钱流入新池，最高纯度信号 | ❌ 待实现 |
+| 🅱 P0 | **Volume Momentum** | 成交量爆发式增长 | ❌ 待实现 |
+| 🅲 P1 | **Cross-Chain Expansion** | token 跨链迁移预示 CEX 上线 | ❌ 待实现 |
+| 🅳 P0 | **New Pool Launch** | DEX 新池早期发现 | ✅ 已运行 |
+
+### 7.3 后续开发路线
+
+```
+Phase 5 (2026-05-09 起)
+  ├─ 🅰 Smart Money Inflow Detection（~2天）
+  │   串联 OKX registry + wallet flow + launch-alpha
+  │   当新池 + 聪明钱买入 = real alpha
+  ├─ 🅱 Volume Momentum Detection（~3天）
+  │   DexScreener Token-Boosts API + pair detail 监控
+  │   volume breakout / price surge / wallet growth
+  └─ 代码重构
+       ├─ catalyst-alpha 产出不再标为 alpha candidate
+       ├─ 改写入 SymbolRegistry.venue_lifecycle
+       └─ 路由层消费 lifecycle 数据调整执行策略
+```

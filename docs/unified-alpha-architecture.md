@@ -61,19 +61,34 @@ Examples:
 - meaningful initial LP add
 - early buyer diversity and strong flow in the first few minutes
 
-### 2. Catalyst Alpha
+### 2. Catalyst Alpha → ⚠️ 已重新定义为「Token Lifecycle Stage Signal」
 
-Applies when an existing token receives a new external catalyst that can alter price discovery.
+**2026-05-09 设计纠偏：CEX 上币监听不是 alpha 源。**
 
-Examples:
+原来的定义——"existing token receives a new external catalyst that can alter price discovery"——在理论上成立，但在生产验证中发现：
 
-- CEX listing notice
-- derivatives listing notice
-- project announcement
-- partnership, buyback, unlock, treasury action
-- large increase in X discussion or narrative intensity
+- CEX 上币通知的 99% 不是交易机会（Coinbase 上 700 个交易对早已存在多年）
+- 真正的 alpha 在上币之前就已经出现在链上数据中
+- CEX 上币的正确用途是**更新 token 的生命周期阶段，告知路由层有新的交易 venue 可用**
 
-Catalyst discovery must not depend on static token matcher configuration. Announcement and RSS sources should emit raw source records first, then extract entities and catalyst structure, then open or update candidates.
+所以 Catalyst Alpha 不再产出 `alpha.candidate_qualified` 事件，而是：
+
+```
+exchangeInfo / instruments 检测到新 symbol
+  → 更新 SymbolRegistry.venue_lifecycle
+  → 路由层读取 venue_lifecycle
+  → 调整执行策略（DEX entry → CEX entry / 滑点调整等）
+```
+
+**Real Alpha Sources（2026-05-09 重新定义）**：
+
+1. **Launch Alpha** — 新池/新 token 发现（保留）
+2. **Smart Money Inflow** — 聪明钱包在新池中的买入行为（新增，P0）
+3. **Volume Momentum** — 成交量爆发/价格动量（新增，P0）
+4. **Flow Alpha** — 钱包流动分析（保留，但改为 discovery 层）
+5. **Cross-Chain Expansion** — token 跨链迁移（新增，P1）
+
+详见 [docs/dex-cex-listing-alert-plan.md](./dex-cex-listing-alert-plan.md) 第 4 节。
 
 ### 3. Flow Alpha
 

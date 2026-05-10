@@ -353,3 +353,73 @@ def test_telegram_publisher_disabled_does_not_consume_events() -> None:
     assert service.process_once(count=10, block_ms=1) == 0
     assert client.acked == []
     assert count_rows(engine, "notification_deliveries") == 0
+
+
+def test_telegram_publisher_skips_cross_dimension_below_min_score() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    init_storage(engine)
+    repository = StorageRepository(engine)
+    settings = AppSettings.load().model_copy(
+        update={
+            "notifications": {
+                "telegram": {
+                    "enabled": True,
+                    "bot_token": "token-1",
+                    "chat_id": "chat-1",
+                    "publish_alpha_types": ["LAUNCH", "CATALYST"],
+                    "min_score": 0.98,
+                    "consumer_group": "telegram-test",
+                    "consumer_name": "telegram-test-1",
+                }
+            }
+        }
+    )
+    client = FakeRedis()
+    sent_messages: list[str] = []
+
+    def transport(bot_token: str, chat_id: str, text: str) -> str:
+        _ = bot_token, chat_id
+        sent_messages.append(text)
+        return "100"
+
+    service = TelegramPublisherService(
+        settings,
+        cast(Redis, client),
+        repository,
+        transport=transport,
+    )
+    service.ensure_stream()
+    publish_raw_events(
+        cast(Redis, client),
+        settings,
+        EventEnvelope(
+            event_id="launch-3:cross_dim",
+            event_type="alpha.cross_dimension_snapshot",
+            source="alpha_collector",
+            chain="solana",
+            token="NEWTKN",
+            observed_at=datetime(2026, 5, 3, 12, 0, tzinfo=UTC),
+            ingested_at=datetime(2026, 5, 3, 12, 0, 1, tzinfo=UTC),
+            payload={
+                "snapshot_id": "launch-3:cross_dim",
+                "alpha_type": "LAUNCH",
+                "trigger_source": "launch",
+                "trigger_score": 0.95,
+                "trigger_reasons": ["launch_depth_confirmed"],
+                "collection_latency_ms": 120,
+            },
+        ),
+    )
+
+    assert service.process_once(count=10, block_ms=1) == 1
+    assert sent_messages == []
+
+    delivery = repository.notifications.load_delivery(
+        channel="telegram",
+        destination="chat-1",
+        candidate_id="launch-3:cross_dim",
+        event_type="alpha.cross_dimension_snapshot",
+    )
+    assert delivery is not None
+    assert delivery["status"] == "skipped"
+    assert str(delivery["error_message"]).startswith("score_below_min:")

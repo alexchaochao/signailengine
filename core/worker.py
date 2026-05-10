@@ -103,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--launch-alpha-live", action="store_true")
     parser.add_argument("--catalyst-alpha-backfill")
     parser.add_argument("--catalyst-alpha-live", action="store_true")
+    parser.add_argument("--momentum-alpha-live", action="store_true")
     parser.add_argument("--flow-measurement-backfill")
     parser.add_argument("--flow-measurement-live", action="store_true")
     parser.add_argument("--telegram-publisher-live", action="store_true")
@@ -535,6 +536,92 @@ def run_launch_alpha_live_sync(settings: AppSettings) -> int:
                     source_name=source.config.source_name or "launch_alpha_live",
                 )
     return 0
+
+
+def run_momentum_alpha_live_sync(settings: AppSettings) -> int:
+    """Run momentum alpha discovery.
+
+    Fetches boosted tokens from DexScreener Token-Boosts API,
+    cross-references pair detail for volume/price, scores by momentum,
+    and publishes qualified candidates to the alpha pipeline.
+    """
+    logger = get_logger("signalengine.momentum_alpha")
+    redis_client = get_redis_client(settings)
+    with _storage_repository(settings) as (_, repository):
+        service = LaunchAlphaSyncService(settings, redis_client, repository)
+        acquisition = settings.acquisition
+        source_configs = list(acquisition.momentum_alpha_sources.values()) if hasattr(acquisition, "momentum_alpha_sources") else []
+
+        if not source_configs:
+            logger.info("momentum_alpha_live_no_sources_configured")
+            return 0
+
+        for source_config in source_configs:
+            if not source_config.enabled:
+                continue
+
+            from discovery.momentum_source import MomentumAlphaSource, MomentumScanResult
+            source = MomentumAlphaSource(settings, source_config)
+            results = source.fetch_snapshots()
+            logger.info(
+                "momentum_alpha_scan_complete",
+                extra={
+                    "source": source_config.source_name or "momentum",
+                    "results": len(results),
+                },
+            )
+
+            for result in results:
+                if result.momentum_score < 0.5:
+                    continue
+
+                logger.info(
+                    "momentum_alpha_candidate",
+                    extra={
+                        "token": result.token,
+                        "chain": result.chain,
+                        "score": result.momentum_score,
+                        "volume_5m": result.volume_5m_usd,
+                        "price_change_1h": result.price_change_1h,
+                    },
+                )
+
+                # Build a LaunchPoolSnapshot-compatible dict and feed to the service
+                snapshot_payload = _momentum_to_snapshot_payload(result, source_name=source_config.source_name or "momentum_alpha_live")
+                service.ingest_snapshot(snapshot_payload, source_name=source_config.source_name or "momentum_alpha_live")
+
+    return 0
+
+
+def _momentum_to_snapshot_payload(result: MomentumScanResult, *, source_name: str) -> dict[str, object]:
+    """Convert a MomentumScanResult to a dict compatible with LaunchPoolSnapshot."""
+    import uuid
+    now = datetime.now(UTC)
+    return {
+        "source_event_id": f"momentum:{result.chain}:{result.token}:{int(now.timestamp())}:{uuid.uuid4().hex[:8]}",
+        "chain": result.chain,
+        "token": result.token,
+        "pool_address": f"momentum:{result.token}",
+        "dex": "dexscreener",
+        "quote_asset": "USD",
+        "observed_at": now.isoformat(),
+        "initial_liquidity_usd": result.liquidity_usd,
+        "liquidity_lock_ratio": None,
+        "buy_notional_5m_usd": result.volume_5m_usd,
+        "trade_count_5m": result.trade_count_5m,
+        "unique_wallets_5m": result.unique_wallets_5m,
+        "smart_money_wallets_5m": 0,
+        "creator_hold_pct": None,
+        "metadata": {
+            "source": source_name,
+            "momentum_score": result.momentum_score,
+            "price_change_1h": result.price_change_1h,
+            "price_usd": result.price_usd,
+            "boost_amount": result.boost_amount,
+            "fdv": result.fdv,
+            "momentum_type": "token_boost",
+        },
+    }
 
 
 def run_telegram_publisher_live(settings: AppSettings) -> int:
@@ -1126,6 +1213,32 @@ def main() -> int:
         while not stop_event.is_set():
             run_catalyst_alpha_live_sync(settings)
             sleep(_effective_interval)
+        return 0
+
+    if args.momentum_alpha_live:
+        acquisition_config = settings.acquisition
+        if args.once:
+            return run_momentum_alpha_live_sync(settings)
+
+        stop_event = Event()
+
+        def _handle_momentum_alpha_live_stop_signal(signum: int, frame: object) -> None:
+            _ = frame
+            logger.info(
+                "momentum_alpha_live_stop_requested",
+                extra={
+                    "service": "momentum_alpha_live",
+                    "outcome": f"signal_{signum}",
+                },
+            )
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, _handle_momentum_alpha_live_stop_signal)
+        signal.signal(signal.SIGTERM, _handle_momentum_alpha_live_stop_signal)
+
+        while not stop_event.is_set():
+            run_momentum_alpha_live_sync(settings)
+            sleep(acquisition_config.sync_interval_seconds)
         return 0
 
     if args.flow_measurement_live:

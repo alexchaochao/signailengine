@@ -1,0 +1,145 @@
+# signalengine 阿里云新加坡 — Docker Compose 部署
+# 用法: docker compose -f docker-compose.aliyun.yml up -d
+# 前置: 安装 Docker + Docker Compose
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: signalengine
+      POSTGRES_USER: signalengine
+      POSTGRES_PASSWORD: ${SIGNALENGINE_DB_PASSWORD:-signalengine}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U signalengine"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── 工作节点 ────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    env_file: .env
+    volumes:
+      - ./logs:/opt/signalengine/.run/full-stack
+    # 默认启动所有 worker，但 docker-compose 不支持 array of commands
+    # 所以每个 worker 单独定义
+    profiles: ["never"]  # 禁用，使用下面的具体服务
+
+  worker-full:
+    <<: &worker-base
+      build:
+        context: .
+        dockerfile: Dockerfile
+      restart: always
+      depends_on:
+        postgres: { condition: service_healthy }
+        redis:    { condition: service_healthy }
+      env_file: .env
+      environment:
+        SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9000"
+      volumes:
+        - ./logs:/opt/signalengine/.run/full-stack
+    command: ["python", "-m", "core.worker", "--group", "signal-workers", "--consumer", "worker-full"]
+
+  catalyst-alpha:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9003"
+    command: ["python", "-m", "core.worker", "--catalyst-alpha-live"]
+
+  launch-alpha:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9002"
+    command: ["python", "-m", "core.worker", "--launch-alpha-live"]
+
+  onchain-feature:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9001"
+    command: ["python", "-m", "core.worker", "--onchain-feature-live"]
+
+  flow-measurement:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9004"
+    command: ["python", "-m", "core.worker", "--flow-measurement-live"]
+
+  social-live:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9005"
+    command: ["python", "-m", "core.worker", "--social-live"]
+
+  social-confirmation:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9006"
+    command:
+      - "python"
+      - "-m"
+      - "core.worker"
+      - "--social-confirmation-live"
+      - "--group"
+      - "social-confirmation"
+      - "--consumer"
+      - "social-confirmation-1"
+
+  telegram-publisher:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9007"
+    command: ["python", "-m", "core.worker", "--telegram-publisher-live"]
+
+  alpha-collector:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9010"
+    command: ["python", "-m", "core.worker", "--alpha-collector-live"]
+
+  alpha-pipeline:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9011"
+    command: ["python", "-m", "core.worker", "--alpha-pipeline-live"]
+
+  wallet-intelligence:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9008"
+    command: ["python", "-m", "core.worker", "--wallet-intelligence-sync"]
+
+  measurement-bridge:
+    <<: *worker-base
+    environment:
+      SIGNALENGINE_OBSERVABILITY__METRICS_PORT: "9009"
+    command: ["python", "-m", "core.worker", "--measurement-bridge"]
+
+volumes:
+  pgdata:
+  redisdata:

@@ -159,6 +159,7 @@ class TelegramPublisherService:
         """Process an alpha.cross_dimension_snapshot event with unified format."""
         snapshot_id = str(event.payload.get("snapshot_id", event.event_id))
         alpha_type = str(event.payload.get("alpha_type", "UNKNOWN")).upper()
+        trigger_score = float(event.payload.get("trigger_score", 0.0) or 0.0)
 
         existing = self.repository.notifications.load_delivery(
             channel="telegram",
@@ -178,6 +179,19 @@ class TelegramPublisherService:
                 status="skipped",
                 payload=event.model_dump(mode="json"),
                 error_message=f"unsupported_alpha_type:{alpha_type}",
+            )
+            self.metrics.notification_deliveries.labels(channel="telegram", status="skipped").inc()
+            return
+
+        if trigger_score < config.min_score:
+            self.repository.notifications.save_delivery(
+                channel="telegram",
+                destination=config.chat_id,
+                candidate_id=snapshot_id,
+                event_type=event.event_type,
+                status="skipped",
+                payload=event.model_dump(mode="json"),
+                error_message=f"score_below_min:{trigger_score}",
             )
             self.metrics.notification_deliveries.labels(channel="telegram", status="skipped").inc()
             return

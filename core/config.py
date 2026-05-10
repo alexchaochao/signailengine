@@ -294,6 +294,36 @@ class CatalystAlphaLiveSourceConfig(BaseModel):
     resolve_multi_chain: bool = False
 
 
+class MomentumAlphaLiveSourceConfig(BaseModel):
+    """Configuration for momentum / Token-Boosts based alpha discovery.
+
+    Fetches boosted tokens from DexScreener, cross-references pair detail
+    for volume/price data, and scores based on boost amount + trading volume.
+    """
+    enabled: bool = False
+    provider: str = "dexscreener_token_boosts"
+    source_name: str | None = None
+    chain: str = "solana"
+    source_url: str = "https://api.dexscreener.com/token-boosts/latest/v1"
+    pair_detail_url: str = "https://api.dexscreener.com/latest/dex/tokens"
+    timeout_seconds: float = 5.0
+    retry_attempts: int = 3
+    retry_backoff_seconds: float = 0.5
+    sync_interval_seconds: float | None = None
+    max_seed_records: int = 30
+    max_snapshot_age_seconds: float = 300.0
+    # Momentum thresholds
+    min_volume_5m_usd: float = 15_000.0
+    min_price_change_1h_pct: float = 10.0
+    min_boost_amount: float = 0.0
+    min_trade_count_5m: int = 10
+    min_unique_wallets_5m: int = 6
+    # Token filter
+    token_denylist: list[str] = Field(
+        default_factory=lambda: ["USDC", "USDT", "SOL", "WETH", "WBTC", "wstETH", "weETH"]
+    )
+
+
 class FlowAlphaBackfillConfig(BaseModel):
     enabled: bool = False
     source_name: str = "flow_alpha_backfill"
@@ -357,6 +387,7 @@ class AcquisitionConfig(BaseModel):
     evm_sources: dict[str, EvmLiveSourceConfig] = Field(default_factory=dict)
     launch_alpha_sources: dict[str, LaunchAlphaLiveSourceConfig] = Field(default_factory=dict)
     catalyst_alpha_sources: dict[str, CatalystAlphaLiveSourceConfig] = Field(default_factory=dict)
+    momentum_alpha_sources: dict[str, MomentumAlphaLiveSourceConfig] = Field(default_factory=dict)
     flow_alpha_sources: dict[str, FlowAlphaLiveSourceConfig] = Field(default_factory=dict)
     social_sources: dict[str, SocialLiveSourceConfig] = Field(default_factory=dict)
 
