@@ -24,7 +24,7 @@ try:
                 continue
             key, _, val = line.partition("=")
             key = key.strip()
-            val = val.strip().strip("'\""")
+            val = val.strip().strip("'\"")
             os.environ[key] = val
 
     from core.config import AppSettings
