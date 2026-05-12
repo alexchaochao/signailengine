@@ -107,7 +107,7 @@ class TelegramNotificationConfig(BaseModel):
     enabled: bool = False
     bot_token: str | None = None
     chat_id: str | None = None
-    publish_alpha_types: list[str] = Field(default_factory=lambda: ["LAUNCH", "CATALYST"])
+    publish_alpha_types: list[str] = Field(default_factory=lambda: ["LAUNCH", "MOMENTUM"])
     min_score: float = 0.0
     message_template_version: str = "v1"
     consumer_group: str = "telegram-publisher"
@@ -124,7 +124,7 @@ class TelegramNotificationConfig(BaseModel):
     @classmethod
     def normalize_alpha_types(cls, value: object) -> list[str]:
         if value is None:
-            return ["LAUNCH", "CATALYST"]
+            return ["LAUNCH", "MOMENTUM"]
         if isinstance(value, list):
             return [str(item).upper() for item in value]
         return [str(value).upper()]

@@ -4,7 +4,8 @@
 """
 import os, subprocess, sys
 
-# Let AppSettings.load() handle .env + env vars directly
+# AppSettings.load() merges YAML with process env vars; this script loads .env into
+# os.environ first so the reported values match the deployed service environment.
 os.environ.setdefault("SIGNALENGINE_RUNTIME__ENVIRONMENT", "production")
 os.chdir("/opt/signalengine")
 
@@ -16,7 +17,7 @@ print()
 # 1. min_score
 print("--- 1. Telegram min_score 实际加载值 ---")
 try:
-    # Load .env — handle values with = signs and quotes
+    # Load .env into the current process before calling AppSettings.load().
     with open("/opt/signalengine/.env") as f:
         for line in f:
             line = line.strip()

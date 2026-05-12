@@ -64,13 +64,13 @@ features:
     max_quote_age_seconds: 5.0
     allow_curve_fallback: true
 
-# 对外通知：当前只给 Telegram 单 chat 推送首次进入 QUALIFIED 的 LAUNCH / CATALYST。
+# 对外通知：当前只给 Telegram 单 chat 推送首次进入 QUALIFIED 的 LAUNCH / MOMENTUM。
 notifications:
   telegram:
     enabled: false
     bot_token:
     chat_id:
-    publish_alpha_types: [LAUNCH, CATALYST]
+    publish_alpha_types: [LAUNCH, MOMENTUM]
     min_score: 0.0
     message_template_version: v1
     consumer_group: telegram-publisher
@@ -293,20 +293,21 @@ acquisition:
       require_mint_revoked: true
       require_creator_lp_transfer: true
 
-  # Catalyst Alpha：公告 / RSS 类催化信息 + exchangeInfo 新币检测。
+  # Catalyst Alpha：交易所上币检测 — 生命周期信号。
   #
-  # 信号优先级（最快 → 最慢）：
-  #   Tier 1 (WS / 0.5-1s) : Binance Announcement WS, OKX instruments WS, Bybit instruments WS
-  #   Tier 2 (poll / 1-2s)  : exchangeInfo diff, Coinbase products API, Binance Alpha API
-  #   Tier 3 (poll / 30s)   : Binance CMS, Coinbase blog (仅 confirmation，非 primary alpha)
-  #   Tier 4 (future)       : Upbit, Hyperliquid, Jupiter Strict List
+  # 🚨 设计修正（2026-05-11）：
+  #   上币检测不是 alpha 源，而是 token 生命周期阶段信号。
+  #   只需要在"下单前"查一次 SymbolRegistry 决定路由（CEX 还是 DEX），
+  #   不需要主动轮询产生事件流。
   #
-  # 🚨 公告类源（CMS/Blog）应仅作为 confirmation/backup！
-  #    真正的低延迟 alpha 来自 WS + symbol state diff。
+  #   自检结果：之前 8 个 source 全部 enabled:true，每 1~60s 轮询一次交易所 API，
+  #   产生大量 alpha.catalyst_candidate 事件流入 raw-events 和 Telegram publisher，
+  #   全部被 min_score=0.98 过滤为 skipped，浪费调度资源和 DB 写入。
+  #
+  #   修正：全部禁用，仅保留 SymbolRegistry 供下单前查询。
   catalyst_alpha_sources:
-    # ── 速度 Tier 2-3：公告类（confirmation only）─────────────────
     binance_listings:
-      enabled: true
+      enabled: false
       provider: binance_cms_api
       source_name: catalyst_alpha_binance
       source_url: https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=20
@@ -325,7 +326,7 @@ acquisition:
       extraction_mode: llm_with_heuristic_fallback
       dedup_enabled: true
     coinbase_blog:
-      enabled: true
+      enabled: false
       provider: coinbase_html_page
       source_name: catalyst_alpha_coinbase
       source_url: https://www.coinbase.com/blog
@@ -343,12 +344,8 @@ acquisition:
       credibility_score: 0.88
       extraction_mode: llm_with_heuristic_fallback
       dedup_enabled: true
-    # ❌ OKX 公告 API 当前返回 404（URL 已变更或需认证）
-    # ✅ 替代方案：OKX instruments WebSocket (wss://ws.okx.com:8443/ws/v5/public)
-    #    监听频道: instruments (SPOT, SWAP)
-    #    当新交易对出现时，WS 推送速度远快于 REST 公告 API
     okx_instruments_ws:
-      enabled: true
+      enabled: false
       provider: okx_instruments_ws
       source_name: catalyst_okx_ws
       sync_interval_seconds: 3.0
@@ -382,13 +379,8 @@ acquisition:
       credibility_score: 0.85
       extraction_mode: llm_with_heuristic_fallback
       dedup_enabled: true
-    # ❌ Bybit 公告 API 当前返回 403（需要 API key 认证）
-    # ✅ 替代方案：Bybit instruments-info WebSocket
-    #    (wss://stream.bybit.com/v5/public/spot)
-    #    监听: public.instruments.info
-    #    当新交易对出现时，WS 推送变化
     bybit_instruments_ws:
-      enabled: true
+      enabled: false
       provider: bybit_instruments_ws
       source_name: catalyst_bybit_ws
       sync_interval_seconds: 3.0
@@ -422,14 +414,11 @@ acquisition:
       credibility_score: 0.85
       extraction_mode: llm_with_heuristic_fallback
       dedup_enabled: true
-
-    # ── 速度 Tier 1-2：exchangeInfo 新币检测源（最快信号）─────────
     binance_exchange_info:
-      enabled: true
+      enabled: false
       provider: binance_exchange_info
       source_name: catalyst_binance_spot
       source_url: https://api.binance.com/api/v3/exchangeInfo
-      # ⚡ 1s 轮询 + Redis symbol diff
       sync_interval_seconds: 1.0
       timeout_seconds: 120.0
       retry_attempts: 3
@@ -443,7 +432,7 @@ acquisition:
       extraction_mode: heuristic
       dedup_enabled: true
     binance_futures_info:
-      enabled: true
+      enabled: false
       provider: binance_futures_info
       source_name: catalyst_binance_futures
       source_url: https://fapi.binance.com/fapi/v1/exchangeInfo
@@ -460,11 +449,10 @@ acquisition:
       extraction_mode: heuristic
       dedup_enabled: true
     binance_alpha_api:
-      enabled: true
+      enabled: false
       provider: binance_alpha_api
       source_name: catalyst_binance_alpha
       source_url: https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list
-      # ⚡ 1s 轮询 — 上线前 alpha 信号
       sync_interval_seconds: 2.0
       timeout_seconds: 120.0
       retry_attempts: 3
@@ -478,7 +466,7 @@ acquisition:
       extraction_mode: heuristic
       dedup_enabled: true
     coinbase_products_api:
-      enabled: true
+      enabled: false
       provider: coinbase_products_api
       source_name: catalyst_coinbase_products
       source_url: https://api.exchange.coinbase.com/products
