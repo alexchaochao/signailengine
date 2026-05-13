@@ -71,7 +71,7 @@ notifications:
     bot_token:
     chat_id:
     publish_alpha_types: [LAUNCH, MOMENTUM]
-    min_score: 0.0
+    min_score: 0.95
     message_template_version: v1
     consumer_group: telegram-publisher
     consumer_name: telegram-publisher-1
