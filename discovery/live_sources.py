@@ -7,9 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from time import monotonic, sleep
 from typing import Any, Callable
-from urllib.error import URLError
+import httpx
 from urllib import parse
-from urllib import request
 
 from core.config import AppSettings, LaunchAlphaLiveSourceConfig
 from core.schemas import CollectorCheckpoint
@@ -202,7 +201,7 @@ class _CachedRateLimitedLaunchTransport:
                         copy.deepcopy(payload),
                     )
                 return payload
-            except (OSError, URLError) as error:
+            except (httpx.HTTPError, OSError) as error:
                 last_error = error
                 self._last_request_at = monotonic()
                 if attempt + 1 >= attempts:
@@ -264,14 +263,52 @@ class _PersistentCheckpointLaunchTransport(_CachedRateLimitedLaunchTransport):
         return f"acquisition:launch_alpha_cache:{self.config.source_name}:{digest}"
 
 
-def _http_json_get_transport(url: str, timeout_seconds: float) -> dict[str, Any] | list[dict[str, Any]]:
-    http_request = request.Request(url, headers={"User-Agent": "signalengine/0.1"})
-    with request.urlopen(http_request, timeout=timeout_seconds) as response:  # noqa: S310
-        body = response.read().decode("utf-8")
-    parsed = json.loads(body)
-    if isinstance(parsed, (dict, list)):
-        return parsed
-    raise ValueError("invalid_launch_snapshot_http_payload")
+def _http_json_get_transport(
+    url: str,
+    timeout_seconds: float,
+    *,
+    retry_attempts: int = 3,
+    retry_backoff_seconds: float = 0.5,
+) -> dict[str, Any] | list[dict[str, Any]]:
+    attempts = max(retry_attempts, 1)
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with httpx.Client() as client:
+                resp = client.get(
+                    url,
+                    timeout=timeout_seconds,
+                    headers={"User-Agent": "signalengine/0.1"},
+                )
+                resp.raise_for_status()
+                body = resp.json()
+            if isinstance(body, (dict, list)):
+                return body
+            raise ValueError("invalid_launch_snapshot_http_payload")
+        except httpx.HTTPStatusError as error:
+            last_error = error
+            if error.response.status_code == 429:
+                if attempt + 1 >= attempts:
+                    break
+                sleep(max(retry_backoff_seconds, 5.0))
+                continue
+            if attempt + 1 >= attempts:
+                break
+            if retry_backoff_seconds > 0:
+                sleep(retry_backoff_seconds)
+        except (httpx.RequestError, OSError) as error:
+            last_error = error
+            if attempt + 1 >= attempts:
+                break
+            if retry_backoff_seconds > 0:
+                sleep(retry_backoff_seconds)
+    if isinstance(last_error, httpx.HTTPStatusError):
+        raise RuntimeError(
+            f"launch_http_{last_error.response.status_code}:{url[:120]}"
+        ) from last_error
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("http_json_transport_failed_without_error")
 
 
 def _dexscreener_token_address(record: dict[str, Any]) -> str | None:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from urllib.error import URLError
+
+import httpx
 
 from core.config import AppSettings, LaunchAlphaLiveSourceConfig
 from core.schemas import CollectorCheckpoint
@@ -180,7 +181,7 @@ def test_launch_live_source_uses_fallback_source_url() -> None:
         _ = timeout_seconds
         calls.append(url)
         if url == config.source_url:
-            raise URLError("primary down")
+            raise httpx.RequestError("primary down")
         return {
             "records": [
                 {
@@ -239,11 +240,12 @@ def test_launch_transport_retries_then_succeeds(monkeypatch) -> None:
         _ = timeout_seconds
         calls.append(url)
         if len(calls) < 3:
-            raise URLError("temporary reset")
+            raise httpx.RequestError("temporary reset")
         return {"records": []}
 
     monkeypatch.setattr("discovery.live_sources._http_json_get_transport", stub_get)
     monkeypatch.setattr("discovery.live_sources.sleep", lambda seconds: None)
+    monkeypatch.setattr("discovery.live_sources.monotonic", lambda: 0.0)
 
     transport = _CachedRateLimitedLaunchTransport(config)
 

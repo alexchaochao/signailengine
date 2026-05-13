@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from urllib.error import URLError
+
+import httpx
 
 from core.config import AppSettings, CatalystAlphaLiveSourceConfig
 from discovery.catalyst_live_sources import (
@@ -248,23 +249,21 @@ def test_catalyst_http_transport_retries_then_succeeds(monkeypatch) -> None:
   calls: list[int] = []
 
   class StubResponse:
-    def __enter__(self):
-      return self
+    def __init__(self):
+      self.status_code = 200
+      self.text = "<rss version='2.0'><channel></channel></rss>"
 
-    def __exit__(self, exc_type, exc, tb):
-      return False
+    def raise_for_status(self) -> None:
+      pass
 
-    def read(self) -> bytes:
-      return b"<rss version='2.0'><channel></channel></rss>"
-
-  def stub_urlopen(http_request, timeout):
-    _ = http_request, timeout
+  def stub_client_get(self, url, *, timeout, headers):
+    _ = self, url, timeout, headers
     calls.append(1)
     if len(calls) < 3:
-      raise URLError("connection reset")
+      raise httpx.RequestError("connection reset")
     return StubResponse()
 
-  monkeypatch.setattr("discovery.catalyst_live_sources.request.urlopen", stub_urlopen)
+  monkeypatch.setattr("httpx.Client.get", stub_client_get)
   monkeypatch.setattr("discovery.catalyst_live_sources.sleep", lambda seconds: None)
 
   payload = _http_text_get_transport(
@@ -281,12 +280,12 @@ def test_catalyst_http_transport_retries_then_succeeds(monkeypatch) -> None:
 def test_catalyst_http_transport_raises_after_retry_budget(monkeypatch) -> None:
   calls: list[int] = []
 
-  def stub_urlopen(http_request, timeout):
-    _ = http_request, timeout
+  def stub_client_get(self, url, *, timeout, headers):
+    _ = self, url, timeout, headers
     calls.append(1)
-    raise URLError("connection reset")
+    raise httpx.RequestError("connection reset")
 
-  monkeypatch.setattr("discovery.catalyst_live_sources.request.urlopen", stub_urlopen)
+  monkeypatch.setattr("httpx.Client.get", stub_client_get)
   monkeypatch.setattr("discovery.catalyst_live_sources.sleep", lambda seconds: None)
 
   try:
@@ -296,9 +295,9 @@ def test_catalyst_http_transport_raises_after_retry_budget(monkeypatch) -> None:
       retry_attempts=2,
       retry_backoff_seconds=0.01,
     )
-  except URLError as error:
+  except httpx.RequestError as error:
     assert "connection reset" in str(error)
   else:
-    raise AssertionError("expected URLError")
+    raise AssertionError("expected httpx.RequestError")
 
   assert len(calls) == 2

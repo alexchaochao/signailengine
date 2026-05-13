@@ -10,8 +10,7 @@ from html import unescape
 from html.parser import HTMLParser
 from time import sleep
 from typing import Callable
-from urllib.error import URLError
-from urllib import request
+import httpx
 
 from redis import Redis
 
@@ -440,14 +439,30 @@ def _http_text_get_transport(
     retry_attempts: int = 3,
     retry_backoff_seconds: float = 0.5,
 ) -> str:
-    http_request = request.Request(url, headers={"User-Agent": "signalengine/0.1"})
     attempts = max(retry_attempts, 1)
     last_error: Exception | None = None
     for attempt in range(attempts):
         try:
-            with request.urlopen(http_request, timeout=timeout_seconds) as response:  # noqa: S310
-                return response.read().decode("utf-8")
-        except (OSError, URLError) as error:
+            with httpx.Client() as client:
+                resp = client.get(
+                    url,
+                    timeout=timeout_seconds,
+                    headers={"User-Agent": "signalengine/0.1"},
+                )
+                resp.raise_for_status()
+                return resp.text
+        except httpx.HTTPStatusError as error:
+            last_error = error
+            if error.response.status_code == 429:
+                if attempt + 1 >= attempts:
+                    break
+                sleep(max(retry_backoff_seconds, 5.0))
+                continue
+            if attempt + 1 >= attempts:
+                break
+            if retry_backoff_seconds > 0:
+                sleep(retry_backoff_seconds)
+        except (httpx.RequestError, OSError) as error:
             last_error = error
             if attempt + 1 >= attempts:
                 break
